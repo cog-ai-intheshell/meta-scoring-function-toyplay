@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 
 def standardize_matrix(X, eps=1e-12):
@@ -22,6 +23,7 @@ def standardize_matrix(X, eps=1e-12):
 
 
 def score_operator(Z, w):
+    """Applique l'operateur lineaire de score a une matrice deja standardisee."""
     Z = np.asarray(Z, dtype=float)
     w = np.asarray(w, dtype=float)
     return Z @ w
@@ -80,6 +82,7 @@ def fit_linear_score_model(X, feature_names, target, target_name="target_gain", 
     score_values = score_operator(Z, w)
 
     return {
+        "model_type": "linear",
         "feature_names": kept_feature_names,
         "mu": mu_kept.tolist(),
         "sigma": sigma_kept.tolist(),
@@ -96,6 +99,59 @@ def apply_linear_score_model(X, score_model):
     Z = standardize_with_score_model(X, score_model)
     weights = np.asarray(score_model["weights"], dtype=float)
     return score_operator(Z, weights)
+
+
+def _as_feature_frame(frame_like):
+    """Convertit une entree tabulaire quelconque en DataFrame pandas."""
+    if isinstance(frame_like, pd.DataFrame):
+        return frame_like.copy()
+    return pd.DataFrame(frame_like)
+
+
+def _apply_linear_score_model_from_frame(frame_like, score_model):
+    """Aligne un DataFrame sur les features du modele puis applique le score lineaire."""
+    frame = _as_feature_frame(frame_like)
+    X = frame[score_model["feature_names"]].values.astype(float)
+    return apply_linear_score_model(X, score_model)
+
+
+def apply_score_model_frame(frame_like, score_model, return_components=False):
+    """Applique un modele lineaire ou hierarchique a un DataFrame de metriques."""
+    model_type = score_model.get("model_type", "linear")
+
+    if model_type == "linear":
+        score_values = _apply_linear_score_model_from_frame(frame_like, score_model)
+        if return_components:
+            return score_values, {}
+        return score_values
+
+    if model_type != "hierarchical_family_score":
+        raise ValueError(f"Type de modele de score inconnu: {model_type}")
+
+    frame = _as_feature_frame(frame_like)
+    family_components = {}
+
+    for family_name, family_model in score_model["family_models"].items():
+        family_components[family_name] = _apply_linear_score_model_from_frame(
+            frame,
+            family_model,
+        )
+
+    family_score_names = score_model["final_model"]["feature_names"]
+    family_score_frame = pd.DataFrame(
+        {
+            name: family_components[name]
+            for name in family_score_names
+        }
+    )
+    score_values = _apply_linear_score_model_from_frame(
+        family_score_frame,
+        score_model["final_model"],
+    )
+
+    if return_components:
+        return score_values, family_components
+    return score_values
 
 
 def standardize_with_score_model(X, score_model):

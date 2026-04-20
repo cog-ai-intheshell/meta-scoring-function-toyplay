@@ -4,10 +4,12 @@ import numpy as np
 # helpers ------------------------------------------------------------------
 
 def _as_float_array(values):
+    """Convertit une suite numerique en tableau NumPy flottant."""
     return np.asarray(values, dtype=float)
 
 
 def _safe_divide(numerator, denominator):
+    """Effectue une division sure en renvoyant 0.0 si le denominateur est nul."""
     if denominator == 0:
         return 0.0
     return numerator / denominator

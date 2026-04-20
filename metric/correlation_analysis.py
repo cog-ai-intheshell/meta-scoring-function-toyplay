@@ -61,3 +61,43 @@ def extract_correlated_pairs(corr_df, threshold=0.98):
 
     pairs.sort(key=lambda item: (-item["abs_corr"], item["left"], item["right"]))
     return pairs
+
+
+def select_uncorrelated_columns_by_target_corr(corr_df, target_corr, threshold=0.98):
+    """Garde prioritairement les colonnes les plus corrélées à la cible."""
+    threshold = float(threshold)
+    target_corr = {
+        name: abs(float(value)) if np.isfinite(value) else 0.0
+        for name, value in target_corr.items()
+    }
+
+    sorted_columns = sorted(
+        corr_df.columns,
+        key=lambda name: (-target_corr.get(name, 0.0), name),
+    )
+
+    kept_columns = []
+    dropped_columns = []
+
+    for column in sorted_columns:
+        correlated_with = None
+
+        for kept in kept_columns:
+            corr_value = float(corr_df.loc[kept, column])
+            if np.isfinite(corr_value) and abs(corr_value) >= threshold:
+                correlated_with = {
+                    "dropped": column,
+                    "kept": kept,
+                    "corr": corr_value,
+                    "abs_corr": abs(corr_value),
+                    "dropped_target_corr": target_corr.get(column, 0.0),
+                    "kept_target_corr": target_corr.get(kept, 0.0),
+                }
+                break
+
+        if correlated_with is None:
+            kept_columns.append(column)
+        else:
+            dropped_columns.append(correlated_with)
+
+    return kept_columns, dropped_columns

@@ -5,11 +5,13 @@ import numpy as np
 
 # Normalise des suites numeriques de metrics calculees par fold.
 def _as_float_array(values):
+    """Convertit une suite de valeurs numeriques en tableau NumPy flottant."""
     return np.asarray(values, dtype=float)
 
 
 # Evite les divisions par zero pour les agregations.
 def _safe_divide(numerator, denominator):
+    """Effectue une division sure en renvoyant 0.0 si le denominateur est nul."""
     if denominator == 0:
         return 0.0
     return numerator / denominator
@@ -17,6 +19,7 @@ def _safe_divide(numerator, denominator):
 
 # Centralise les ecarts-types avec un comportement stable sur tableaux vides.
 def _std_or_zero(values):
+    """Retourne l'ecart-type d'une suite ou 0.0 si elle est vide."""
     values = _as_float_array(values)
     if values.size == 0:
         return 0.0

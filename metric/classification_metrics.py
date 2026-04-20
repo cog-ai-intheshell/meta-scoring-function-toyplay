@@ -6,6 +6,7 @@ import numpy as np
 # Normalise les entrees de classification en tableaux NumPy
 # pour simplifier les calculs vectorises dans tout le module.
 def _as_arrays(y_pred, y_true):
+    """Convertit les sorties de classification et les labels en tableaux NumPy homogènes."""
     y_pred = np.asarray(y_pred)
     y_true = np.asarray(y_true)
     return y_pred, y_true
@@ -14,6 +15,7 @@ def _as_arrays(y_pred, y_true):
 # Force les scores probabilistes au bon format numerique
 # avant les metriques comme le log loss, le Brier score ou l'AUC.
 def _as_probability_arrays(y_proba, y_true):
+    """Convertit les probabilites et les labels en tableaux NumPy compatibles."""
     y_proba = np.asarray(y_proba, dtype=float)
     y_true = np.asarray(y_true)
     return y_proba, y_true
@@ -22,6 +24,7 @@ def _as_probability_arrays(y_proba, y_true):
 # Evite les divisions par zero et renvoie 0.0
 # pour garder des metriques stables meme sur des cas degeneres.
 def _safe_divide(numerator, denominator):
+    """Effectue une division sure en renvoyant 0.0 quand le denominateur est nul."""
     if denominator == 0:
         return 0.0
     return numerator / denominator
@@ -30,6 +33,7 @@ def _safe_divide(numerator, denominator):
 # Coupe les probabilites aux bornes ouvertes ]0, 1[
 # pour eviter les log(0) dans le calcul du log loss.
 def _clip_probabilities(y_proba):
+    """Borne les probabilites dans ]0,1[ pour eviter les singularites numeriques."""
     epsilon = np.finfo(float).eps
     return np.clip(y_proba, epsilon, 1 - epsilon)
 
@@ -37,6 +41,7 @@ def _clip_probabilities(y_proba):
 # Centralise le calcul de TP, TN, FP et FN
 # afin que toutes les metriques derivent de la meme logique.
 def _confusion_counts(y_pred, y_true):
+    """Calcule une seule fois TP, TN, FP et FN pour reutilisation dans le module."""
     y_pred, y_true = _as_arrays(y_pred, y_true)
 
     tp = int(np.sum((y_true == 1) & (y_pred == 1)))
@@ -226,6 +231,7 @@ def classification_metric_dict(y_pred, y_true):
         "recall": recall(y_pred, y_true),
         "specificity": specificity(y_pred, y_true),
         "mcc": mcc(y_pred, y_true),
+        "balanced_accuracy": balanced_accuracy(y_pred, y_true),
         "ppr": predicted_positive_rate(y_pred, y_true),
         "prevalence": prevalence(y_pred, y_true),
     }

@@ -5,11 +5,13 @@ import numpy as np
 
 # Normalise les scores de decision en tableau numerique.
 def _as_score_array(y_score):
+    """Convertit un vecteur de scores en tableau NumPy flottant."""
     return np.asarray(y_score, dtype=float)
 
 
 # Normalise a la fois les scores et la verite terrain.
 def _as_score_and_true_arrays(y_score, y_true):
+    """Convertit conjointement les scores et les labels en tableaux compatibles."""
     y_score = _as_score_array(y_score)
     y_true = np.asarray(y_true)
     return y_score, y_true
@@ -17,6 +19,7 @@ def _as_score_and_true_arrays(y_score, y_true):
 
 # Evite les divisions par zero pour les metriques agregees.
 def _safe_divide(numerator, denominator):
+    """Effectue une division sure en renvoyant 0.0 si le denominateur est nul."""
     if denominator == 0:
         return 0.0
     return numerator / denominator
@@ -24,12 +27,14 @@ def _safe_divide(numerator, denominator):
 
 # Convertit un score en decision binaire a partir d'un seuil.
 def _decision_label_array(y_score, threshold):
+    """Transforme un score probabiliste en prediction binaire a un seuil donne."""
     y_score = _as_score_array(y_score)
     return (y_score >= threshold).astype(int)
 
 
 # Construit un ensemble stable de seuils candidats a partir des scores.
 def _threshold_candidates(y_score):
+    """Construit un ensemble de seuils candidats stables a partir des scores observes."""
     y_score = np.clip(_as_score_array(y_score), 0.0, 1.0)
 
     if y_score.size == 0:
@@ -40,12 +45,14 @@ def _threshold_candidates(y_score):
 
 # Mesure la distance absolue au seuil, interpretee comme marge de decision.
 def _threshold_distance_array(y_score, threshold):
+    """Calcule la distance absolue de chaque score au seuil de decision."""
     y_score = _as_score_array(y_score)
     return np.abs(y_score - threshold)
 
 
 # Calcule une moyenne sur un sous-ensemble; renvoie 0.0 si le masque est vide.
 def _masked_mean(values, mask):
+    """Calcule une moyenne sur un sous-ensemble masque avec sortie sure si vide."""
     values = np.asarray(values, dtype=float)
     mask = np.asarray(mask, dtype=bool)
 
@@ -58,8 +65,23 @@ def _masked_mean(values, mask):
     return float(np.mean(values[mask]))
 
 
+def _masked_median(values, mask):
+    """Calcule une mediane sur un sous-ensemble masque avec sortie sure si vide."""
+    values = np.asarray(values, dtype=float)
+    mask = np.asarray(mask, dtype=bool)
+
+    if values.shape != mask.shape:
+        raise ValueError("values et mask doivent avoir la meme forme")
+
+    if not np.any(mask):
+        return 0.0
+
+    return float(np.median(values[mask]))
+
+
 # Calcule rapidement un F1 binaire sans dependre d'un autre module.
 def _f1_at_threshold(y_score, y_true, threshold):
+    """Calcule le F1 obtenu si l'on applique un seuil donne aux probabilites."""
     y_score, y_true = _as_score_and_true_arrays(y_score, y_true)
     y_pred = _decision_label_array(y_score, threshold)
 
@@ -179,6 +201,42 @@ def threshold_distance_tn(y_score, y_true, threshold):
     return _masked_mean(distances, mask)
 
 
+def threshold_distance_median_tp(y_score, y_true, threshold):
+    """Distance mediane au seuil pour les vrais positifs."""
+    y_score, y_true = _as_score_and_true_arrays(y_score, y_true)
+    y_pred = _decision_label_array(y_score, threshold)
+    distances = _threshold_distance_array(y_score, threshold)
+    mask = (y_true == 1) & (y_pred == 1)
+    return _masked_median(distances, mask)
+
+
+def threshold_distance_median_fp(y_score, y_true, threshold):
+    """Distance mediane au seuil pour les faux positifs."""
+    y_score, y_true = _as_score_and_true_arrays(y_score, y_true)
+    y_pred = _decision_label_array(y_score, threshold)
+    distances = _threshold_distance_array(y_score, threshold)
+    mask = (y_true == 0) & (y_pred == 1)
+    return _masked_median(distances, mask)
+
+
+def threshold_distance_median_fn(y_score, y_true, threshold):
+    """Distance mediane au seuil pour les faux negatifs."""
+    y_score, y_true = _as_score_and_true_arrays(y_score, y_true)
+    y_pred = _decision_label_array(y_score, threshold)
+    distances = _threshold_distance_array(y_score, threshold)
+    mask = (y_true == 1) & (y_pred == 0)
+    return _masked_median(distances, mask)
+
+
+def threshold_distance_median_tn(y_score, y_true, threshold):
+    """Distance mediane au seuil pour les vrais negatifs."""
+    y_score, y_true = _as_score_and_true_arrays(y_score, y_true)
+    y_pred = _decision_label_array(y_score, threshold)
+    distances = _threshold_distance_array(y_score, threshold)
+    mask = (y_true == 0) & (y_pred == 0)
+    return _masked_median(distances, mask)
+
+
 def implicit_linear_threshold(y_score, y_true):
     """Seuil implicite qui aligne au mieux le taux de positifs predits sur la prevalence."""
     y_score, y_true = _as_score_and_true_arrays(y_score, y_true)
@@ -251,10 +309,21 @@ def select_best_threshold(y_score, y_true, default_threshold=0.5, scoring_fn=Non
 
 
 def threshold_geometry_metric_dict(y_score, y_true, threshold):
-    """Construit le bloc des metriques de geometrie autour du seuil."""
+    """Construit le bloc des metriques de separation autour du seuil."""
     return {
-        "dist_tp": threshold_distance_tp(y_score, y_true, threshold),
-        "dist_fp": threshold_distance_fp(y_score, y_true, threshold),
-        "dist_tn": threshold_distance_tn(y_score, y_true, threshold),
-        "dist_fn": threshold_distance_fn(y_score, y_true, threshold),
+        "median_dist_tp": threshold_distance_median_tp(y_score, y_true, threshold),
+        "median_dist_tn": threshold_distance_median_tn(y_score, y_true, threshold),
+        "median_dist_fp": threshold_distance_median_fp(y_score, y_true, threshold),
+        "median_dist_fn": threshold_distance_median_fn(y_score, y_true, threshold),
+        "threshold_confidence_ratio": threshold_confidence_ratio(
+            y_score,
+            y_true,
+            threshold,
+        ),
+        "threshold_confidence_gap": threshold_confidence_gap(
+            y_score,
+            y_true,
+            threshold,
+        ),
+        "implicit_threshold": implicit_linear_threshold(y_score, y_true),
     }

@@ -1,60 +1,27 @@
-from pathlib import Path
-
 import numpy as np
 import pandas as pd
 
 from xgboost import XGBClassifier
 
+import config
+from data_gathering import prebuilt_dataset
 from metric import correlation_analysis
 from metric import scoring_function
 from metric import window_metrics
-import temporal_dataset
 
 
 # ============================================================
-# 1. Configuration
+# 2. Chargement dataset preconstruit
 # ============================================================
 
-RANDOM_STATE = 42
-rng = np.random.default_rng(RANDOM_STATE)
-
-MODEL_LIFE_WINDOW = 10
-N_WINDOWS = 170
-
-INITIAL_BALANCE = 10_000.0
-TP_GAIN = 0.04
-FP_LOSS = 0.03
-THRESHOLD = 0.5
-CORR_THRESHOLD = 0.98
-TOP_N_CORRELATED_PAIRS = 10
-SCORE_MODEL_PATH = Path("artifacts/score_function.json")
-TEMPORAL_MODE = "stochastic"
-STOCHASTIC_RANDOM_STATE = 42
-STOCHASTIC_JITTER = 0.22
-STOCHASTIC_SMOOTH_WINDOW = 48
-
-INITIAL_TRAIN_SIZE = 97  # 1797 - 170*10 = 97
-
-
-# ============================================================
-# 2. Chargement dataset
-#    Digits -> binaire
-#    "momentum" = chiffre >= 5
-# ============================================================
-
-temporal_data = temporal_dataset.load_temporal_digits(
-    mode=TEMPORAL_MODE,
-    random_state=STOCHASTIC_RANDOM_STATE,
-    jitter=STOCHASTIC_JITTER,
-    smooth_window=STOCHASTIC_SMOOTH_WINDOW,
-)
+temporal_data = prebuilt_dataset.load_prebuilt_dataset()
 
 X = temporal_data["data"]
 y = temporal_data["momentum"]
 temporal_stats = temporal_data["sequence_stats"]
 
 n_samples = len(y)
-required = INITIAL_TRAIN_SIZE + N_WINDOWS * MODEL_LIFE_WINDOW
+required = config.required_samples()
 
 if n_samples < required:
     raise ValueError(
@@ -64,11 +31,12 @@ if n_samples < required:
 
 print(f"Nombre total de lignes : {n_samples}")
 print(f"Mode temporel         : {temporal_data['mode']}")
+print(f"Source dataset        : {temporal_data['path'].resolve()}")
 print(f"Taux momentum         : {temporal_stats['momentum_rate']:.4f}")
 print(f"Switches temporels    : {temporal_stats['switches']}")
-print(f"Train initial         : {INITIAL_TRAIN_SIZE}")
-print(f"Fenêtres              : {N_WINDOWS}")
-print(f"Taille fenêtre        : {MODEL_LIFE_WINDOW}")
+print(f"Train initial         : {config.INITIAL_TRAIN_SIZE}")
+print(f"Fenêtres              : {config.N_WINDOWS}")
+print(f"Taille fenêtre        : {config.MODEL_LIFE_WINDOW}")
 print()
 
 
@@ -77,34 +45,139 @@ print()
 # ============================================================
 
 def train_model(X_train, y_train, seed=42):
-    model = XGBClassifier(
-        n_estimators=120,
-        max_depth=4,
-        learning_rate=0.08,
-        subsample=0.9,
-        colsample_bytree=0.9,
-        eval_metric="logloss",
-        random_state=seed,
-    )
+    """Entraine un XGBoost sur le train courant avec la configuration par defaut."""
+    model = XGBClassifier(**config.build_xgb_params(seed))
     model.fit(X_train, y_train)
     return model
 
 
+def build_empirical_basis(X_values, column_names, target_values, corr_threshold):
+    """Construit une base de variables non constantes, peu corrélées et de rang utile."""
+    X_values = np.asarray(X_values, dtype=float)
+    target_values = np.asarray(target_values, dtype=float)
+    X_clean = np.nan_to_num(X_values, nan=0.0)
+    name_to_index = {name: j for j, name in enumerate(column_names)}
+
+    non_constant_names = [
+        name
+        for j, name in enumerate(column_names)
+        if np.std(X_clean[:, j]) > 1e-12
+    ]
+
+    if non_constant_names:
+        target_corr = {
+            name: scoring_function.pearson_corr_safe(
+                X_values[:, name_to_index[name]],
+                target_values,
+            )
+            for name in non_constant_names
+        }
+        non_constant_indices = [name_to_index[name] for name in non_constant_names]
+        corr_df = correlation_analysis.correlation_matrix_ignore_nan(
+            X_values[:, non_constant_indices],
+            non_constant_names,
+        )
+        filtered_names, dropped_corr = correlation_analysis.select_uncorrelated_columns_by_target_corr(
+            corr_df,
+            target_corr,
+            threshold=corr_threshold,
+        )
+    else:
+        target_corr = {}
+        filtered_names = []
+        dropped_corr = []
+
+    selected_names = []
+    current = None
+
+    for name in filtered_names:
+        col = X_clean[:, [name_to_index[name]]]
+
+        if current is None:
+            selected_names.append(name)
+            current = col
+            continue
+
+        rank_before = np.linalg.matrix_rank(current)
+        candidate = np.column_stack([current, col])
+        rank_after = np.linalg.matrix_rank(candidate)
+
+        if rank_after > rank_before:
+            selected_names.append(name)
+            current = candidate
+
+    return {
+        "X_clean": X_clean,
+        "target_corr": target_corr,
+        "non_constant_names": non_constant_names,
+        "filtered_names": filtered_names,
+        "dropped_corr": dropped_corr,
+        "selected_names": selected_names,
+        "current": current,
+    }
+
+
+def build_family_score_bundle(
+    df_train,
+    df_test,
+    df_all,
+    family_name,
+    family_cols,
+    target_train,
+    corr_threshold,
+):
+    """Apprend le sous-score d'une famille et l'applique aux splits train, test et global."""
+    family_basis = build_empirical_basis(
+        df_train[family_cols].values,
+        family_cols,
+        target_train,
+        corr_threshold=corr_threshold,
+    )
+
+    selected_cols = family_basis["selected_names"]
+    if not selected_cols:
+        raise ValueError(
+            f"Aucune metrique exploitable pour la famille '{family_name}'."
+        )
+
+    family_model, train_scores = scoring_function.fit_linear_score_model(
+        df_train[selected_cols].values,
+        selected_cols,
+        target_train,
+        target_name=f"gain_effective_{family_name}",
+    )
+    test_scores = scoring_function.apply_linear_score_model(
+        df_test[family_model["feature_names"]].values,
+        family_model,
+    )
+    all_scores = scoring_function.apply_linear_score_model(
+        df_all[family_model["feature_names"]].values,
+        family_model,
+    )
+
+    score_column = f"score_{family_name}"
+
+    return {
+        "family_name": family_name,
+        "score_column": score_column,
+        "basis": family_basis,
+        "model": family_model,
+        "train_scores": train_scores,
+        "test_scores": test_scores,
+        "all_scores": all_scores,
+    }
+
+
 # ============================================================
-# 4. Split initial random
+# 4. Split initial séquentiel
 # ============================================================
 
-all_indices = np.arange(n_samples)
-rng.shuffle(all_indices)
+X_train = X[:config.INITIAL_TRAIN_SIZE]
+y_train = y[:config.INITIAL_TRAIN_SIZE]
+remaining_pool_size = n_samples - config.INITIAL_TRAIN_SIZE
 
-train_indices = all_indices[:INITIAL_TRAIN_SIZE].tolist()
-pool_indices = all_indices[INITIAL_TRAIN_SIZE:].tolist()
-
-X_train = X[train_indices]
-y_train = y[train_indices]
-
-print(f"Taille train initial : {len(train_indices)}")
-print(f"Taille pool restante : {len(pool_indices)}")
+print(f"Taille train initial : {len(X_train)}")
+print(f"Taille pool restante : {remaining_pool_size}")
 print()
 
 
@@ -112,38 +185,38 @@ print()
 # 5. Boucle séquentielle par fenêtres
 # ============================================================
 
-balance = INITIAL_BALANCE
+balance = config.INITIAL_BALANCE
 rows = []
 
-for window_id in range(1, N_WINDOWS + 1):
-    chosen_pos = rng.choice(len(pool_indices), size=MODEL_LIFE_WINDOW, replace=False)
-    chosen_pos_set = set(chosen_pos.tolist())
+for window_id in range(1, config.N_WINDOWS + 1):
+    window_start = config.INITIAL_TRAIN_SIZE + (window_id - 1) * config.MODEL_LIFE_WINDOW
+    window_end = window_start + config.MODEL_LIFE_WINDOW
 
-    window_indices = [pool_indices[pos] for pos in chosen_pos]
+    X_window = X[window_start:window_end]
+    y_window = y[window_start:window_end]
 
-    pool_indices = [idx for j, idx in enumerate(pool_indices) if j not in chosen_pos_set]
+    model = train_model(X_train, y_train, seed=config.RANDOM_STATE + window_id)
 
-    X_window = X[window_indices]
-    y_window = y[window_indices]
-
-    model = train_model(X_train, y_train, seed=RANDOM_STATE + window_id)
-
+    y_train_proba = model.predict_proba(X_train)[:, 1]
     y_proba = model.predict_proba(X_window)[:, 1]
 
     metric_row = window_metrics.build_window_metric_dict(
         y_window,
         y_proba,
         balance_start=balance,
-        threshold=THRESHOLD,
-        tp_gain=TP_GAIN,
-        fp_loss=FP_LOSS,
+        threshold=config.THRESHOLD,
+        tp_gain=config.TP_GAIN,
+        fp_loss=config.FP_LOSS,
+        history_rows=rows,
+        y_train_true=y_train,
+        y_train_proba=y_train_proba,
     )
     balance = metric_row["balance_end"]
 
     row = {
         "window_id": window_id,
         "train_size_before_update": len(X_train),
-        "test_window_size": MODEL_LIFE_WINDOW,
+        "test_window_size": config.MODEL_LIFE_WINDOW,
     }
     row.update(metric_row)
     rows.append(row)
@@ -160,24 +233,21 @@ df_windows = pd.DataFrame(rows)
 
 classification_cols = window_metrics.CLASSIFICATION_COLS
 separation_cols = window_metrics.SEPARATION_COLS
-calibration_cols = window_metrics.CALIBRATION_COLS
-decision_cols = window_metrics.DECISION_COLS
-threshold_geometry_cols = window_metrics.THRESHOLD_GEOMETRY_COLS
+generalization_cols = window_metrics.GENERALIZATION_COLS
+stability_cols = window_metrics.STABILITY_COLS
 gain_cols = window_metrics.GAIN_COLS
 
 M_classification = df_windows[classification_cols].values
 M_separation = df_windows[separation_cols].values
-M_calibration = df_windows[calibration_cols].values
-M_decision = df_windows[decision_cols].values
-M_threshold_geometry = df_windows[threshold_geometry_cols].values
+M_generalization = df_windows[generalization_cols].values
+M_stability = df_windows[stability_cols].values
 M_gain = df_windows[gain_cols].values
 
 print("=== Formes des vecteurs par famille ===")
 print("classification      :", M_classification.shape)
 print("separation          :", M_separation.shape)
-print("calibration         :", M_calibration.shape)
-print("decision            :", M_decision.shape)
-print("threshold_geometry  :", M_threshold_geometry.shape)
+print("generalization      :", M_generalization.shape)
+print("stabilite           :", M_stability.shape)
 print("gain                :", M_gain.shape)
 print()
 
@@ -244,35 +314,34 @@ print()
 # 10. Base empirique gloutonne
 # ============================================================
 
-non_constant_indices = [
-    j for j in range(X_metrics_clean.shape[1])
-    if np.std(X_metrics_clean[:, j]) > 1e-12
-]
+basis_all = build_empirical_basis(
+    X_metrics,
+    metric_cols,
+    df_windows["gain_effective"].values.astype(float),
+    corr_threshold=config.CORR_THRESHOLD,
+)
+selected_metric_names = basis_all["selected_names"]
+current = basis_all["current"]
 
-selected_indices = []
-current = None
-
-for j in non_constant_indices:
-    col = X_metrics_clean[:, [j]]
-
-    if current is None:
-        selected_indices.append(j)
-        current = col
-        continue
-
-    rank_before = np.linalg.matrix_rank(current)
-    candidate = np.column_stack([current, col])
-    rank_after = np.linalg.matrix_rank(candidate)
-
-    if rank_after > rank_before:
-        selected_indices.append(j)
-        current = candidate
-
-selected_metric_names = [metric_cols[j] for j in selected_indices]
+print(
+    f"=== Filtrage automatique des colonnes trop corrélées (>=|{config.CORR_THRESHOLD}|) ==="
+)
+if basis_all["dropped_corr"]:
+    for item in basis_all["dropped_corr"]:
+        print(
+            f"{item['dropped']:25s} -> retiree, trop correlee a "
+            f"{item['kept']:25s} "
+            f"(corr={item['corr']:+.6f}, abs={item['abs_corr']:.6f}, "
+            f"target_kept={item['kept_target_corr']:.6f}, "
+            f"target_drop={item['dropped_target_corr']:.6f})"
+        )
+else:
+    print("Aucune")
+print()
 
 print("=== Base empirique gloutonne ===")
-print("Indices   :", selected_indices)
-print("Métriques :", selected_metric_names)
+print("Métriques candidates après filtrage :", basis_all["filtered_names"])
+print("Métriques retenues                  :", selected_metric_names)
 print()
 
 if current is not None:
@@ -328,10 +397,10 @@ print()
 # 14. Paires fortement corrélées
 # ============================================================
 
-print(f"=== Paires de métriques fortement corrélées (>=|{CORR_THRESHOLD}|) ===")
+print(f"=== Paires de métriques fortement corrélées (>=|{config.CORR_THRESHOLD}|) ===")
 correlated_pairs = correlation_analysis.extract_correlated_pairs(
     corr_df,
-    threshold=CORR_THRESHOLD,
+    threshold=config.CORR_THRESHOLD,
 )
 threshold_pairs = [
     pair for pair in correlated_pairs if pair["is_above_threshold"]
@@ -347,8 +416,8 @@ else:
     print("Aucune paire fortement corrélée trouvée.")
 print()
 
-print(f"=== Top {TOP_N_CORRELATED_PAIRS} paires les plus corrélées ===")
-for pair in correlated_pairs[:TOP_N_CORRELATED_PAIRS]:
+print(f"=== Top {config.TOP_N_CORRELATED_PAIRS} paires les plus corrélées ===")
+for pair in correlated_pairs[:config.TOP_N_CORRELATED_PAIRS]:
     print(
         f"{pair['left']:25s} <-> {pair['right']:25s} : "
         f"corr={pair['corr']:+.6f} abs={pair['abs_corr']:.6f}"
@@ -357,108 +426,190 @@ print()
 
 
 # ============================================================
-# 15. Construction d'une base empirique EX ANTE
-#     (sans les métriques de gain)
+# 15. Split score train / test
 # ============================================================
 
-ex_ante_metric_cols = window_metrics.EX_ANTE_METRIC_COLS
+df_score_train = df_windows.iloc[:config.SCORE_TRAIN_WINDOWS].copy()
+df_score_test = df_windows.iloc[config.SCORE_TRAIN_WINDOWS:].copy()
+target_gain_train = df_score_train["gain_effective"].values.astype(float)
+target_gain_test = df_score_test["gain_effective"].values.astype(float)
 
-X_ex_ante = df_windows[ex_ante_metric_cols].values
-X_ex_ante_clean = np.nan_to_num(X_ex_ante, nan=0.0)
-
-print("=== Matrice ex ante utilisée pour construire la base ===")
-print(pd.DataFrame(X_ex_ante_clean, columns=ex_ante_metric_cols).head())
+print("=== Split apprentissage / evaluation du score ===")
+print(f"Fenêtres pour apprendre le score : {len(df_score_train)}")
+print(f"Fenêtres jamais vues pour test   : {len(df_score_test)}")
+print(
+    f"Train windows ids                : "
+    f"{df_score_train['window_id'].min()} -> {df_score_train['window_id'].max()}"
+)
+print(
+    f"Test windows ids                 : "
+    f"{df_score_test['window_id'].min()} -> {df_score_test['window_id'].max()}"
+)
 print()
 
-rank_ex_ante = np.linalg.matrix_rank(X_ex_ante_clean)
-print(f"Rang de la matrice ex ante : {rank_ex_ante}")
-print(f"Nombre de métriques ex ante: {X_ex_ante_clean.shape[1]}")
-print()
 
-non_constant_ex_ante_indices = [
-    j for j in range(X_ex_ante_clean.shape[1])
-    if np.std(X_ex_ante_clean[:, j]) > 1e-12
-]
+# ============================================================
+# 16. Construction de la base par famille
+# ============================================================
 
-selected_ex_ante_indices = []
-current_ex_ante = None
+family_column_map = {
+    "classification": window_metrics.CLASSIFICATION_COLS,
+    "separation": window_metrics.SEPARATION_COLS,
+    "generalization": window_metrics.GENERALIZATION_COLS,
+    "stabilite": window_metrics.STABILITY_COLS,
+}
 
-for j in non_constant_ex_ante_indices:
-    col = X_ex_ante_clean[:, [j]]
+family_bundles = {}
+family_score_cols = []
 
-    if current_ex_ante is None:
-        selected_ex_ante_indices.append(j)
-        current_ex_ante = col
-        continue
+for family_name, family_cols in family_column_map.items():
+    bundle = build_family_score_bundle(
+        df_score_train,
+        df_score_test,
+        df_windows,
+        family_name,
+        family_cols,
+        target_gain_train,
+        corr_threshold=config.CORR_THRESHOLD,
+    )
+    family_bundles[family_name] = bundle
+    family_score_cols.append(bundle["score_column"])
 
-    rank_before = np.linalg.matrix_rank(current_ex_ante)
-    candidate = np.column_stack([current_ex_ante, col])
-    rank_after = np.linalg.matrix_rank(candidate)
-
-    if rank_after > rank_before:
-        selected_ex_ante_indices.append(j)
-        current_ex_ante = candidate
-
-basis_ex_ante_cols = [ex_ante_metric_cols[j] for j in selected_ex_ante_indices]
-
-print("=== Base empirique ex ante ===")
-print("Indices   :", selected_ex_ante_indices)
-print("Métriques :", basis_ex_ante_cols)
-print()
-
-if current_ex_ante is not None:
-    print("=== Matrice associée à la base ex ante ===")
-    print(pd.DataFrame(current_ex_ante, columns=basis_ex_ante_cols).head())
+    print(f"=== Famille {family_name} ===")
+    print("Colonnes candidates :", family_cols)
+    print("Colonnes non constantes :", bundle["basis"]["non_constant_names"])
+    print("Corrélation à gain_effective :")
+    for name in sorted(
+        bundle["basis"]["target_corr"],
+        key=lambda item: -abs(bundle["basis"]["target_corr"][item]),
+    ):
+        print(
+            f"  {name:25s} -> "
+            f"{bundle['basis']['target_corr'][name]:+.6f}"
+        )
+    print(
+        f"Filtrage corrélé automatique (>=|{config.CORR_THRESHOLD}|, "
+        "priorité à la corrélation cible) :"
+    )
+    if bundle["basis"]["dropped_corr"]:
+        for item in bundle["basis"]["dropped_corr"]:
+            print(
+                f"  {item['dropped']:25s} -> retiree, trop correlee a "
+                f"{item['kept']:25s} "
+                f"(corr={item['corr']:+.6f}, "
+                f"target_kept={item['kept_target_corr']:.6f}, "
+                f"target_drop={item['dropped_target_corr']:.6f})"
+            )
+    else:
+        print("  Aucune")
+    print("Colonnes retenues pour le sous-score :", bundle["model"]["feature_names"])
     print()
 
 
 # ============================================================
-# 16. Apprentissage et sauvegarde du score
+# 17. Apprentissage du score final sur les sous-scores de famille
 # ============================================================
 
-target_gain = df_windows["gain_effective"].values.astype(float)
+family_score_train_df = pd.DataFrame(
+    {
+        bundle["score_column"]: bundle["train_scores"]
+        for bundle in family_bundles.values()
+    }
+)
+family_score_test_df = pd.DataFrame(
+    {
+        bundle["score_column"]: bundle["test_scores"]
+        for bundle in family_bundles.values()
+    }
+)
+family_score_all_df = pd.DataFrame(
+    {
+        bundle["score_column"]: bundle["all_scores"]
+        for bundle in family_bundles.values()
+    }
+)
 
-score_model, score_values = scoring_function.fit_linear_score_model(
-    df_windows[basis_ex_ante_cols].values,
-    basis_ex_ante_cols,
-    target_gain,
+final_score_model, final_train_scores = scoring_function.fit_linear_score_model(
+    family_score_train_df[family_score_cols].values,
+    family_score_cols,
+    target_gain_train,
     target_name="gain_effective",
 )
-basis_ex_ante_cols_kept = score_model["feature_names"]
-Z_basis = scoring_function.standardize_with_score_model(
-    df_windows[basis_ex_ante_cols_kept].values,
-    score_model,
+final_family_score_cols_kept = final_score_model["feature_names"]
+Z_basis_train = scoring_function.standardize_with_score_model(
+    family_score_train_df[final_family_score_cols_kept].values,
+    final_score_model,
 )
-w = np.asarray(score_model["weights"], dtype=float)
-score_gain_corr = float(score_model["training_target_corr"])
+score_values_test = scoring_function.apply_linear_score_model(
+    family_score_test_df[final_family_score_cols_kept].values,
+    final_score_model,
+)
+score_values_all = scoring_function.apply_linear_score_model(
+    family_score_all_df[final_family_score_cols_kept].values,
+    final_score_model,
+)
+w = np.asarray(final_score_model["weights"], dtype=float)
+score_gain_corr_train = float(final_score_model["training_target_corr"])
+score_gain_corr_test = scoring_function.pearson_corr_safe(
+    score_values_test,
+    target_gain_test,
+)
+score_gain_corr_all = scoring_function.pearson_corr_safe(
+    score_values_all,
+    df_windows["gain_effective"].values.astype(float),
+)
+
+score_model = {
+    "model_type": "hierarchical_family_score",
+    "family_models": {
+        bundle["score_column"]: bundle["model"]
+        for bundle in family_bundles.values()
+    },
+    "family_bases": {
+        bundle["score_column"]: {
+            "candidate_feature_names": family_column_map[bundle["family_name"]],
+            "non_constant_feature_names": bundle["basis"]["non_constant_names"],
+            "target_corr": bundle["basis"]["target_corr"],
+            "filtered_feature_names": bundle["basis"]["filtered_names"],
+            "selected_feature_names": bundle["model"]["feature_names"],
+            "dropped_corr": bundle["basis"]["dropped_corr"],
+        }
+        for bundle in family_bundles.values()
+    },
+    "final_model": final_score_model,
+    "training_target_corr": score_gain_corr_train,
+}
 
 saved_score_path = scoring_function.save_score_model(
     score_model,
-    SCORE_MODEL_PATH,
-    metadata={
-        "random_state": RANDOM_STATE,
-        "model_life_window": MODEL_LIFE_WINDOW,
-        "n_windows": N_WINDOWS,
-        "initial_balance": INITIAL_BALANCE,
-        "tp_gain": TP_GAIN,
-        "fp_loss": FP_LOSS,
-        "threshold": THRESHOLD,
-        "initial_train_size": INITIAL_TRAIN_SIZE,
-    },
+    config.SCORE_MODEL_PATH,
+    metadata=config.score_model_metadata(),
 )
 
-print("=== Poids du score appris sur la base ex ante ===")
-for name, weight in zip(basis_ex_ante_cols_kept, w):
+print("=== Sous-scores de famille retenus pour le score final ===")
+print(family_score_cols)
+print()
+
+print("=== Poids du score final appris sur la base des 4 familles ===")
+for name, weight in zip(final_family_score_cols_kept, w):
     print(f"{name:25s} : {weight:+.6f}")
 print()
 
-print("=== Base ex ante après centrage-réduction ===")
-print("Métriques gardées :", basis_ex_ante_cols_kept)
-print("Forme de Z_basis  :", Z_basis.shape)
+print("=== Base finale après centrage-réduction ===")
+print("Sous-scores gardés :", final_family_score_cols_kept)
+print("Forme de Z_basis_train :", Z_basis_train.shape)
 print()
 
-print("=== Corrélation Pearson(score, gain_effective) ===")
-print(score_gain_corr)
+print("=== Corrélation Pearson(score, gain_effective) sur les fenêtres train ===")
+print(score_gain_corr_train)
+print()
+
+print("=== Corrélation Pearson(score, gain_effective) sur les fenêtres test jamais vues ===")
+print(score_gain_corr_test)
+print()
+
+print("=== Corrélation Pearson(score, gain_effective) sur l'ensemble des fenêtres ===")
+print(score_gain_corr_all)
 print()
 
 print("=== Score sauvegardé ===")
@@ -467,26 +618,37 @@ print()
 
 
 # ============================================================
-# 17. Ajouter le score au DataFrame
+# 18. Ajouter le score au DataFrame
 # ============================================================
 
-df_windows["score_metric"] = score_values
+for column in family_score_all_df.columns:
+    df_windows[column] = family_score_all_df[column].values
+
+df_windows["score_metric"] = score_values_all
 
 print("=== Aperçu score_metric vs gain_effective ===")
 print(df_windows[["window_id", "score_metric", "gain_effective"]].head())
 print()
 
-print("=== Corrélation finale score_metric / gain_effective ===")
+print("=== Aperçu hold-out score_metric vs gain_effective ===")
 print(
-    df_windows[["score_metric", "gain_effective"]]
-    .corr(numeric_only=True)
-    .iloc[0, 1]
+    df_score_test.assign(
+        **{
+            column: family_score_test_df[column].values
+            for column in family_score_test_df.columns
+        },
+        score_metric=score_values_test,
+    )[["window_id"] + family_score_cols + ["score_metric", "gain_effective"]].head()
 )
+print()
+
+print("=== Corrélation finale score_metric / gain_effective sur le hold-out ===")
+print(score_gain_corr_test)
 print()
 
 
 # ============================================================
-# 18. Corrélations du score avec toutes les métriques
+# 19. Corrélations du score avec toutes les métriques
 # ============================================================
 
 print("=== Corrélations avec score_metric ===")
@@ -501,9 +663,10 @@ print()
 
 
 # ============================================================
-# 19. Affichage des vecteurs constituant la base
+# 20. Affichage des vecteurs constituant la base
 # ============================================================
 
+'''
 print("=== Vecteurs de la base empirique (colonnes) ===")
 
 if current is not None:
@@ -515,9 +678,10 @@ else:
 
 print("\n=== Vecteurs de base après centrage-réduction ===")
 
-if Z_basis is not None:
-    for idx, (name, col) in enumerate(zip(basis_ex_ante_cols_kept, Z_basis.T)):
+if Z_basis_train is not None:
+    for idx, (name, col) in enumerate(zip(basis_ex_ante_cols_kept, Z_basis_train.T)):
         print(f"\nVecteur normalisé {idx+1} : {name}")
         print(col)
 else:
     print("Aucune base normalisée disponible.")
+'''

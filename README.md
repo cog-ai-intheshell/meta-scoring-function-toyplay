@@ -2,21 +2,19 @@
 
 Projet d'experimentation autour d'une fonction de score "meta" pour evaluer des fenetres de predictions binaires.
 
-L'idee generale est la suivante :
+Le pipeline actuel repose sur :
 
-- on prend le dataset `digits` de `scikit-learn`
-- on le transforme en probleme binaire : `digit >= 5` devient `momentum = 1`
-- on entraine un modele `XGBoost`
-- on evalue ce modele sur une succession de fenetres
-- on calcule, pour chaque fenetre, un ensemble de metriques de classification, calibration, decision et gain
-- on apprend ensuite une fonction de score lineaire capable d'expliquer au mieux le `gain_effective`
-
-Le score appris est sauvegarde dans `artifacts/score_function.json` et peut ensuite etre reutilise pour piloter une recherche d'hyperparametres avec Optuna.
+- un dataset CSV fixe `data_gathering/dataset.csv`
+- un backtest sequentiel sur `170` fenetres de taille `10`
+- un modele `XGBoost`
+- une base de score organisee en `4` familles de metriques
+- un score hierarchique appris sur les `120` premieres fenetres
+- une evaluation finale sur `50` fenetres holdout jamais vues
 
 ## Objectif
 
-Le depot ne cherche pas seulement a mesurer la qualite predictive d'un modele.
-Il cherche surtout a construire une metrique composee qui soit bien alignee avec une performance de type "gain" sur une fenetre.
+Le projet ne cherche pas seulement a predire `momentum`.
+Il cherche surtout a construire un score de qualite de fenetre aligne avec `gain_effective`.
 
 En pratique :
 
@@ -24,7 +22,53 @@ En pratique :
 - une prediction positive incorrecte coute `-3%`
 - une prediction negative n'ouvre pas de trade
 
-Le projet apprend donc un score "ex ante" a partir de metriques observables avant d'utiliser la cible de gain.
+Le score meta ne contient pas les metriques de gain dans sa base, mais il est appris pour expliquer au mieux `gain_effective`.
+
+## Dataset
+
+Le code charge directement :
+
+- `data_gathering/dataset.csv`
+
+Ce fichier contient :
+
+- `dataset_index`
+- `original_index`
+- les colonnes `pixel_*`
+- la cible binaire `momentum`
+
+Le CSV est construit a partir du dataset `digits`, puis reordonne pour suivre une structure de regimes inspiree de `data_gathering/reference.csv`.
+
+Le dossier `data_gathering` contient donc maintenant :
+
+- `digits_source.csv` : la source fixe du dataset `digits` avec `pixel_*` et `number_label`
+- `reference.csv` : la reference de regimes
+- `dataset.csv` : le dataset final utilise par le pipeline
+
+## Configuration
+
+Toute la configuration est centralisee dans `config.py`.
+
+On y retrouve notamment :
+
+- les chemins des donnees et artefacts
+- `DIGIT_POSITIVE_MIN_LABEL = 8`
+- `INITIAL_TRAIN_SIZE = 97`
+- `MODEL_LIFE_WINDOW = 10`
+- `N_WINDOWS = 170`
+- `SCORE_TRAIN_WINDOWS = 120`
+- `HOLDOUT_WINDOWS = 50`
+- les parametres de gain
+- les bornes de recherche Optuna
+- le seuil de filtrage des correlations fortes
+
+Pour la generation du CSV :
+
+- si `DIGIT_POSITIVE_MIN_LABEL = 5`, alors `momentum = 1` pour les labels `5..9`
+- si `DIGIT_POSITIVE_MIN_LABEL = 7`, alors `momentum = 1` pour les labels `7..9`
+- si `DIGIT_POSITIVE_MIN_LABEL = 8`, alors `momentum = 1` pour les labels `8..9`
+
+L'idee est que toute modification experimentale passe par `config.py`.
 
 ## Pipeline principal
 
@@ -32,64 +76,154 @@ Le script principal est `main.py`.
 
 Il execute les etapes suivantes :
 
-1. Charge le dataset `digits` puis construit une cible binaire `momentum`.
-2. Genere une version temporelle du dataset via `temporal_dataset.py`.
-3. Initialise un train set puis un pool d'exemples restants.
-4. Repete une boucle sur `170` fenetres de `10` observations.
-5. Entraine un `XGBClassifier` a chaque fenetre.
-6. Calcule les metriques de la fenetre :
-   - confusion (`tp`, `tn`, `fp`, `fn`)
-   - classification (`precision`, `recall`, `specificity`, `mcc`)
-   - separation (`auc`)
-   - calibration (`logloss`, `brier`)
-   - decision (`ppr`, `prevalence`)
-   - geometrie autour du seuil (`dist_tp`, `dist_fp`, `dist_tn`, `dist_fn`)
-   - gain (`gain_realized`, `gain_max_possible`, `gain_effective`, `balance_start`, `balance_end`)
-7. Analyse la redondance entre metriques via le rang matriciel et les correlations.
-8. Construit une base empirique gloutonne sur les metriques "ex ante" seulement.
-9. Apprend une fonction de score lineaire sur `gain_effective`.
-10. Sauvegarde le modele de score dans `artifacts/score_function.json`.
+1. Charge le CSV preconstruit.
+2. Utilise les `97` premieres lignes comme train initial.
+3. Parcourt ensuite `170` fenetres contigues de `10` observations.
+4. Entraine un `XGBClassifier` avant chaque fenetre.
+5. Calcule les metriques de fenetre.
+6. Decoupe la base de score en `4` familles :
+   - `classification`
+   - `separation`
+   - `generalization`
+   - `stabilite`
+7. Sur les `120` premieres fenetres seulement, construit une base par famille :
+   - retrait des colonnes constantes
+   - retrait des colonnes trop correlees
+   - priorite donnee a la colonne la plus corrélée a `gain_effective`
+   - selection gloutonne par rang
+8. Apprend un sous-score lineaire dans chaque famille.
+9. Construit une matrice des `4` sous-scores :
+   - `score_classification`
+   - `score_separation`
+   - `score_generalization`
+   - `score_stabilite`
+10. Apprend le score final sur cette matrice `120 x 4`.
+11. Evalue ce score sur les `50` fenetres suivantes jamais vues.
+12. Sauvegarde le modele dans `artifacts/score_function.json`.
+
+## Base de score actuelle
+
+La base finale est hierarchique.
+
+### Famille `classification`
+
+- `tp`
+- `tn`
+- `fp`
+- `fn`
+- `precision`
+- `recall`
+- `specificity`
+- `mcc`
+- `balanced_accuracy`
+
+### Famille `separation`
+
+- `auc`
+- `logloss`
+- `brier`
+- `median_dist_tp`
+- `median_dist_tn`
+- `median_dist_fp`
+- `median_dist_fn`
+- `threshold_confidence_ratio`
+- `threshold_confidence_gap`
+
+### Famille `generalization`
+
+- `empirical_overfitting`
+- `empirical_bias`
+- `empirical_variance`
+- `empirical_residual_noise`
+
+### Famille `stabilite`
+
+- `auc_std`
+- `logloss_std`
+- `recall_std`
+- `precision_std`
+- `ppr_std`
+- `threshold_std`
+- `threshold_drift`
+- `robustness_gap`
+- `stability_score`
+
+Les metriques de gain restent calculees, mais elles ne font pas partie de la base de score.
 
 ## Apprentissage du score
 
 L'apprentissage du score se fait dans `metric/scoring_function.py`.
 
-Le principe est simple :
+Le modele de score n'est plus un simple score lineaire "plat".
+Le pipeline est maintenant en deux etages :
 
-- les metriques selectionnees sont centrees-reduites
-- les colonnes constantes ou quasi constantes sont eliminees
-- chaque feature recueille un poids proportionnel a sa correlation de Pearson avec la cible
-- le vecteur de poids est normalise
-- le score final d'une fenetre est le produit matriciel `Z @ w`
+1. un sous-score lineaire par famille
+2. un score final lineaire sur les `4` sous-scores de famille
 
-Le fichier JSON sauvegarde contient :
+Autrement dit :
 
-- les noms de features gardees
-- les moyennes et ecarts-types de standardisation
-- les poids du score
-- la correlation d'entrainement entre le score et `gain_effective`
-- des metadonnees de configuration
+- chaque famille produit un resume numerique
+- la base finale du score vaut :
+  - `base_finale = [score_classification, score_separation, score_generalization, score_stabilite]`
+
+Le JSON sauvegarde contient donc :
+
+- les modeles de famille
+- les bases retenues dans chaque famille
+- le modele final
+- la correlation d'entrainement avec `gain_effective`
+- les metadonnees de configuration
 
 ## Recherche d'hyperparametres
 
-Le script `optuna_xgb_simple.py` recharge le score appris et l'utilise comme objectif d'optimisation.
+Le script `optuna_xgb_simple.py` recharge la score function et l'utilise comme objectif d'optimisation.
 
-Au lieu d'optimiser directement l'accuracy ou le logloss, il :
+Le principe est :
 
-- rejoue le pipeline par fenetres
-- recalcule les metriques pour un jeu d'hyperparametres donne
-- applique la fonction de score sauvegardee
-- retourne la mediane des scores de fenetre comme objectif Optuna
+- rejouer le backtest fenetre par fenetre
+- recalculer toutes les metriques
+- reappliquer le score hierarchique sauvegarde
+- optimiser uniquement sur les `120` premieres fenetres
+- retourner la mediane des scores de fenetre comme objectif Optuna
 
 Le meilleur resultat est sauvegarde dans `artifacts/optuna_best_xgb.json`.
+
+## Evaluation holdout finale
+
+Le script `evaluate_holdout_xgb.py` sert a evaluer le meilleur XGB sur les `50` fenetres jamais vues.
+
+Il :
+
+- recharge la score function
+- recharge les meilleurs hyperparametres trouves par Optuna
+- rejoue le backtest sequentiel
+- isole les fenetres `121..170`
+- affiche le resume global :
+  - `TP`, `TN`, `FP`, `FN`
+  - `gain_realized`, `gain_ratio`, `gain_effective_mean`
+  - `score_median`, `score_mean`, `score_corr_gain_effective`
+- affiche le detail par fenetre
+- expose aussi les sous-scores de famille sur le holdout
+- genere un plot des probabilites predites du XGB
+
+Le plot est produit via `ploting.py`.
 
 ## Structure du projet
 
 ```text
 .
+├── backtest.py
+├── config.py
+├── data_gathering/
+│   ├── digits_source.csv
+│   ├── dataset.csv
+│   ├── generate_dataset.py
+│   ├── prebuilt_dataset.py
+│   └── reference.csv
+├── evaluate_holdout_xgb.py
 ├── main.py
-├── temporal_dataset.py
 ├── optuna_xgb_simple.py
+├── ploting.py
 ├── metric/
 │   ├── classification_metrics.py
 │   ├── correlation_analysis.py
@@ -97,21 +231,22 @@ Le meilleur resultat est sauvegarde dans `artifacts/optuna_best_xgb.json`.
 │   ├── gain_metrics.py
 │   ├── generalization_metrics.py
 │   ├── scoring_function.py
-│   ├── structural_scores.py
 │   └── window_metrics.py
 └── artifacts/
+    ├── holdout_evaluation.json
+    ├── holdout_probability_predictions.png
     ├── score_function.json
     └── optuna_best_xgb.json
 ```
 
 ## Installation
 
-Le depot ne contient pas encore de fichier `requirements.txt` ou `pyproject.toml`.
+Le depot ne contient pas encore de `requirements.txt` ou `pyproject.toml`.
 Les dependances minimales visibles dans le code sont :
 
+- `matplotlib`
 - `numpy`
 - `pandas`
-- `scikit-learn`
 - `xgboost`
 - `optuna`
 
@@ -120,65 +255,122 @@ Installation rapide :
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install numpy pandas scikit-learn xgboost optuna
+pip install matplotlib numpy pandas xgboost optuna
 ```
 
 ## Execution
 
-Generer la fonction de score :
+Ordre d'execution recommande :
 
 ```bash
 python3 main.py
+python3 optuna_xgb_simple.py
+python3 evaluate_holdout_xgb.py
 ```
 
-Lancer la recherche d'hyperparametres apres generation du score :
+Ce flux donne :
+
+- `main.py` : apprentissage de la score function hierarchique
+- `optuna_xgb_simple.py` : optimisation XGB sur les `120` fenetres train
+- `evaluate_holdout_xgb.py` : evaluation finale sur les `50` fenetres holdout + plot
+
+Regenerer le CSV preconstruit :
 
 ```bash
-python3 optuna_xgb_simple.py
+python3 -m data_gathering.generate_dataset \
+  --digits-csv data_gathering/digits_source.csv
+```
+
+Par defaut, le generateur utilise :
+
+- `data_gathering/digits_source.csv` comme source `digits`
+- `data_gathering/reference.csv` comme template de regimes
+- `data_gathering/dataset.csv` comme sortie
+
+Tu peux aussi surcharger les chemins si besoin :
+
+```bash
+python3 -m data_gathering.generate_dataset \
+  --digits-csv data_gathering/digits_source.csv \
+  --template-csv data_gathering/reference.csv \
+  --output data_gathering/dataset.csv
 ```
 
 ## Artefacts produits
 
 ### `artifacts/score_function.json`
 
-Contient la fonction de score apprise :
+Contient :
 
-- features retenues
-- statistiques de standardisation
-- poids lineaires
-- metadonnees de configuration
+- les sous-modeles de famille
+- la base retenue dans chaque famille
+- le modele final sur les `4` sous-scores
+- les metadonnees de configuration
 
 ### `artifacts/optuna_best_xgb.json`
 
-Contient le resultat de la recherche Optuna :
+Contient :
 
-- meilleure valeur de score
-- meilleurs hyperparametres XGBoost
-- nombre d'essais
+- la meilleure valeur de score
+- les meilleurs hyperparametres XGBoost
+- le nombre d'essais
+- un resume train / holdout du meilleur modele
+
+### `artifacts/holdout_evaluation.json`
+
+Contient :
+
+- le resume global holdout
+- le detail par fenetre
+- le chemin du plot genere
+
+### `artifacts/holdout_probability_predictions.png`
+
+Plot des probabilites predites par le meilleur XGB sur le holdout :
+
+- points colores selon la classe reelle
+- marquage `TP`, `TN`, `FP`, `FN`
+- seuil de decision
 
 ## Points d'attention
 
 ### Sequence temporelle
 
-Le module `temporal_dataset.py` peut construire une sequence "stochastic" avec une dynamique temporelle synthetique.
-Cependant, dans `main.py`, les indices sont ensuite melanges puis les fenetres sont tirees aleatoirement dans un pool restant.
+Le projet utilise un CSV preconstruit dont l'ordre encode deja la dynamique temporelle.
+Les scripts respectent strictement cet ordre :
 
-Il faut donc voir ce pipeline comme :
+- train initial sur les `97` premieres lignes
+- evaluation sur `170` fenetres contigues de `10` lignes
+- apprentissage du score sur les `120` premieres fenetres
+- optimisation XGB sur ces memes `120` fenetres
+- evaluation finale sur les `50` dernieres fenetres
 
-- une simulation sequentielle par fenetres
-- avec accumulation progressive du train set
-- mais pas comme un backtest strictement chronologique
+### Sens de `train`, `test` et `all`
+
+Dans `main.py` :
+
+- `train` = fenetres `1..120`
+- `test` = fenetres `121..170`
+- `all` = fenetres `1..170`
+
+`all` est un indicateur descriptif global.
+Le vrai critere de generalisation est `test`, puis le holdout final apres Optuna.
 
 ### Modules utilitaires
 
-Les modules `metric/structural_scores.py` et `metric/generalization_metrics.py` servent surtout de bibliotheques utilitaires pour des scores plus riches, mais ils ne sont pas au coeur du pipeline execute par `main.py`.
+Le coeur du pipeline courant passe surtout par :
+
+- `backtest.py`
+- `metric/window_metrics.py`
+- `metric/scoring_function.py`
+- `metric/correlation_analysis.py`
 
 ## Resume rapide
 
 Si tu veux comprendre le depot vite :
 
-- `main.py` apprend une fonction de score sur des fenetres de prediction
-- `temporal_dataset.py` fabrique la version pseudo-temporelle du dataset
-- `metric/window_metrics.py` assemble toutes les metriques de fenetre
-- `metric/scoring_function.py` apprend et sauvegarde le score lineaire
-- `optuna_xgb_simple.py` optimise XGBoost avec ce score comme objectif
+- `config.py` est la source unique de configuration
+- `backtest.py` porte la boucle sequentielle commune
+- `main.py` apprend un score hierarchique en `4` familles
+- `optuna_xgb_simple.py` optimise XGBoost sur les `120` fenetres train
+- `evaluate_holdout_xgb.py` juge le meilleur modele sur les `50` fenetres jamais vues
