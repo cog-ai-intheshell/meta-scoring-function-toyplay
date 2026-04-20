@@ -45,6 +45,7 @@ HOLDOUT_EVALUATION_PATH = Path("artifacts/holdout_evaluation.json")
 HOLDOUT_PLOT_PATH = Path("artifacts/holdout_probability_predictions.png")
 REFERENTIAL_PLOT_PATH = Path("artifacts/referential_score_evolution.png")
 HOLDOUT_REFERENTIAL_PLOT_PATH = Path("artifacts/holdout_referential_score_evolution.png")
+FULL_PROTOCOL_REFERENTIAL_HTML_PATH = Path("artifacts/full_protocol_referential_3d.html")
 HOLDOUT_MODEL_RUNS_CSV_PATH = Path("artifacts/holdout_model_runs.csv")
 
 GENERATOR_DIGITS_SOURCE_PATH = DIGITS_SOURCE_CSV_PATH
@@ -54,7 +55,7 @@ GENERATOR_DEV_OUTPUT_PATH = DATASET_DEV_PATH
 GENERATOR_HOLDOUT_OUTPUT_PATH = DATASET_HOLDOUT_PATH
 GENERATOR_RANDOM_STATE = RANDOM_STATE
 
-OPTUNA_N_TRIALS = 20
+OPTUNA_N_TRIALS = 2
 OPTUNA_N_ESTIMATORS_BOUNDS = (50, 250)
 OPTUNA_MAX_DEPTH_BOUNDS = (2, 8)
 OPTUNA_LEARNING_RATE_BOUNDS = (0.01, 0.30)

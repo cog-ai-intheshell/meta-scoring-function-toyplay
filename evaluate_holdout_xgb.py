@@ -7,7 +7,11 @@ from backtest import evaluate_rows_with_score, run_window_backtest
 import config
 from data_gathering import prebuilt_dataset
 from metric import scoring_function
-from ploting import plot_probability_predictions, plot_referential_score_evolution
+from ploting import (
+    plot_probability_predictions,
+    plot_referential_score_evolution,
+    plot_referential_score_evolution_html_3d,
+)
 from tools.name_generator import generate_unique_model_name
 
 
@@ -42,7 +46,13 @@ def load_best_params():
     return best_params, payload
 
 
-def build_holdout_run_record(model_name, best_params, holdout_summary):
+def build_holdout_run_record(
+    model_name,
+    best_params,
+    dev_train_corr,
+    train_evaluation,
+    holdout_summary,
+):
     """Construit la ligne CSV d'historique d'un run holdout."""
     record = {
         "evaluated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -60,6 +70,15 @@ def build_holdout_run_record(model_name, best_params, holdout_summary):
             "gain_realized": holdout_summary["gain_realized"],
             "gain_ratio": holdout_summary["gain_ratio"],
             "score_median": holdout_summary["score_median"],
+            "score_corr_gain_effective_dev_train": dev_train_corr,
+            "score_corr_gain_effective_dev_optimized": (
+                None
+                if train_evaluation is None
+                else train_evaluation.get("score_corr_gain_effective")
+            ),
+            "score_corr_gain_effective_holdout": holdout_summary[
+                "score_corr_gain_effective"
+            ],
             "tp": holdout_summary["tp"],
             "tn": holdout_summary["tn"],
             "fp": holdout_summary["fp"],
@@ -112,6 +131,28 @@ def main():
         config.OPTUNA_TRAIN_WINDOWS * config.MODEL_LIFE_WINDOW:
     ]
 
+    detail_all_df = pd.DataFrame(rows_all)
+    score_values_all = scoring_function.apply_score_model_frame(
+        detail_all_df,
+        score_model,
+    )
+    detail_all_df["score_metric"] = score_values_all
+    all_coordinates_df = scoring_function.extract_score_coordinates_frame(
+        detail_all_df,
+        score_model,
+    )
+    full_referential_df = pd.DataFrame(
+        {
+            "model_life_window": detail_all_df["window_id"].values.astype(int),
+            "classification": all_coordinates_df["score_classification"].values.astype(float),
+            "separation": all_coordinates_df["score_separation"].values.astype(float),
+            "generalization": all_coordinates_df["score_generalization"].values.astype(float),
+            "stabilite": all_coordinates_df["score_stabilite"].values.astype(float),
+            "score_metric": score_values_all.astype(float),
+            "gain_effective": detail_all_df["gain_effective"].values.astype(float),
+        }
+    )
+
     detail_df = pd.DataFrame(rows_holdout)
     score_values_holdout, family_components = scoring_function.apply_score_model_frame(
         detail_df,
@@ -150,9 +191,22 @@ def main():
         title="Trajectoire du holdout dans R(O; classification; separation; generalization; stabilite), indexee par model-life-window",
         path=config.HOLDOUT_REFERENTIAL_PLOT_PATH,
     )
+    full_protocol_referential_html_path = plot_referential_score_evolution_html_3d(
+        full_referential_df,
+        title=(
+            "Trajectoire interactive du protocole complet "
+            "dev + holdout dans le referentiel"
+        ),
+        path=config.FULL_PROTOCOL_REFERENTIAL_HTML_PATH,
+        split_window_id=config.OPTUNA_TRAIN_WINDOWS,
+    )
+    dev_train_corr = score_model.get("training_target_corr")
+    train_evaluation = best_payload.get("train_evaluation")
     holdout_run_record = build_holdout_run_record(
         model_name,
         best_params,
+        dev_train_corr,
+        train_evaluation,
         holdout_summary,
     )
     holdout_runs_csv_path = append_holdout_run_csv(holdout_run_record)
@@ -172,6 +226,11 @@ def main():
         "holdout_plot_path": str(plot_path) if plot_path is not None else None,
         "holdout_referential_plot_path": (
             str(referential_plot_path) if referential_plot_path is not None else None
+        ),
+        "full_protocol_referential_html_path": (
+            str(full_protocol_referential_html_path)
+            if full_protocol_referential_html_path is not None
+            else None
         ),
     }
 
@@ -204,6 +263,10 @@ def main():
     if referential_plot_path is not None:
         print("=== Holdout referential plot saved to ===")
         print(referential_plot_path.resolve())
+        print()
+    if full_protocol_referential_html_path is not None:
+        print("=== Full protocol 3D HTML saved to ===")
+        print(full_protocol_referential_html_path.resolve())
         print()
     print("=== Holdout runs CSV updated ===")
     print(holdout_runs_csv_path.resolve())
