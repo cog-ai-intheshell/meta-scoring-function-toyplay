@@ -106,6 +106,23 @@ def build_referential_frame(
     return pd.DataFrame(referential_payload)
 
 
+def compute_referential_origin(basis_coordinates, zero_tolerance=1e-12):
+    """Calcule l'origine du referentiel comme barycentre des coordonnees de base."""
+    basis_coordinates = np.asarray(basis_coordinates, dtype=float)
+
+    if basis_coordinates.ndim != 2:
+        raise ValueError("basis_coordinates doit etre une matrice 2D.")
+
+    origin = basis_coordinates.mean(axis=0)
+    origin[np.abs(origin) < zero_tolerance] = 0.0
+    return origin
+
+
+def format_referential_point(point):
+    """Formate un point du referentiel pour l'affichage console."""
+    return "(" + ", ".join(f"{value:.6f}" for value in point) + ")"
+
+
 def format_linear_operator_phi(
     feature_names,
     weights,
@@ -860,12 +877,43 @@ referential_plot_path = plot_referential_score_evolution(
     path=config.REFERENTIAL_PLOT_PATH,
     split_window_id=None,
 )
+referential_axis_names = [
+    name.replace("score_", "")
+    for name in final_family_score_cols_kept
+]
+referential_spatial_vectors = [
+    f"{axis_name}(t)"
+    for axis_name in referential_axis_names
+]
+referential_origin = compute_referential_origin(Z_basis_train)
 
 print("=== Référentiel d'étude ===")
-print("R(O; classification; separation; generalization; stabilite)")
-print("Origine O :", "(0, 0, 0, 0)")
-print("Axes : classification, separation, generalization, stabilite")
-print("Parametre de trajectoire : model_life_window")
+print(
+    f"R((O; {', '.join(referential_spatial_vectors)}); t)"
+)
+print("Origine O :", format_referential_point(referential_origin))
+print(
+    "Repere spatial a l'instant t : "
+    f"(O; {', '.join(referential_spatial_vectors)})"
+)
+print("Repere temporel : t = model_life_window")
+print(
+    "Le repere spatial est donc indexe par le temps t, "
+    f"et ici t correspond a la model-life-window. "
+    f"Une model-life-window contient {config.MODEL_LIFE_WINDOW} observations consecutives du dataset."
+)
+'''
+print(
+    "Ici, classification(t), separation(t), generalization(t) et stabilite(t) "
+    "designent bien les vecteurs-colonnes reels de la base finale transformee, "
+    "et non de simples etiquettes statiques d'axes."
+)
+print(
+    "Autrement dit, le repere spatial est constitue par les 4 vecteurs de base "
+    "effectivement utilises dans le referentiel apres centrage-reduction, "
+    "et apres transformation geometrique si elle est activee."
+)
+'''
 if final_score_model.get("orthogonalized", False):
     print("Base finale orthogonalisee : oui, par decomposition QR.")
 else:
