@@ -18,12 +18,14 @@ def _validate_dataset_size(momentum, n_windows):
         )
 
 
-def load_backtest_dataset(n_windows=None):
+def load_backtest_dataset(n_windows=None, path=None):
     """Charge le dataset preconstruit et valide sa taille pour le backtest voulu."""
     if n_windows is None:
         n_windows = config.N_WINDOWS
+    if path is None:
+        path = config.DATASET_PATH
 
-    dataset = prebuilt_dataset.load_prebuilt_dataset()
+    dataset = prebuilt_dataset.load_prebuilt_dataset(path)
     _validate_dataset_size(dataset["momentum"], n_windows)
     return dataset
 
@@ -161,6 +163,7 @@ def evaluate_rows_with_score(rows, score_model):
             "score_median": 0.0,
             "score_mean": 0.0,
             "score_corr_gain_effective": 0.0,
+            "score_corr_method": config.TARGET_CORR_METHOD,
         }
 
     score_df = pd.DataFrame(rows)
@@ -173,8 +176,13 @@ def evaluate_rows_with_score(rows, score_model):
             "score_median": float(np.median(score_values)),
             "score_mean": float(np.mean(score_values)),
             "score_corr_gain_effective": float(
-                scoring_function.pearson_corr_safe(score_values, target_gain)
+                scoring_function.correlation_safe(
+                    score_values,
+                    target_gain,
+                    method=config.TARGET_CORR_METHOD,
+                )
             ),
+            "score_corr_method": config.TARGET_CORR_METHOD,
         }
     )
     return summary

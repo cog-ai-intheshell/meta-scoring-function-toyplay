@@ -15,6 +15,8 @@ Les fichiers centraux sont :
 - `data_gathering/digits_source.csv`
 - `data_gathering/reference.csv`
 - `data_gathering/dataset.csv`
+- `data_gathering/dataset_dev.csv`
+- `data_gathering/dataset_holdout.csv`
 - `main.py`
 - `optuna_xgb_simple.py`
 - `evaluate_holdout_xgb.py`
@@ -57,14 +59,24 @@ Ici :
 
 ## 2. Dataset fixe
 
-Le code charge directement :
+Le generateur construit trois CSV :
 
-`data_gathering/dataset.csv`
+- `data_gathering/dataset.csv` : sequence complete
+- `data_gathering/dataset_dev.csv` : train initial + `120` premieres fenetres
+- `data_gathering/dataset_holdout.csv` : `50` dernieres fenetres
 
-On note ce dataset :
+On note la sequence complete :
 
 $$
 \mathcal{D} = \{(x_t, y_t)\}_{t=1}^n
+$$
+
+et les deux splits physiques :
+
+$$
+\mathcal{D}_{\text{dev}} = \{(x_t, y_t)\}_{t=1}^{1297},
+\qquad
+\mathcal{D}_{\text{holdout}} = \{(x_t, y_t)\}_{t=1298}^{1797}.
 $$
 
 avec :
@@ -210,19 +222,25 @@ $$
 \qquad
 \texttt{MODEL\_LIFE\_WINDOW} = 10,
 \qquad
-\texttt{N\_WINDOWS} = 170.
+\texttt{N\_WINDOWS} = 120,
+\qquad
+\texttt{FULL\_PROTOCOL\_WINDOWS} = 170.
 $$
 
 On a :
 
 $$
-97 + 170 \times 10 = 1797.
+97 + 120 \times 10 = 1297
+\quad \text{pour } \mathcal{D}_{\text{dev}},
+\qquad
+97 + 170 \times 10 = 1797
+\quad \text{pour le protocole complet}.
 $$
 
-Toutes les observations sont donc consommees exactement une fois :
+Le dataset de developpement consomme donc :
 
 - soit dans le train initial
-- soit dans une unique fenetre d'evaluation
+- soit dans une unique fenetre d'evaluation dev
 
 ### 4.1 Fenetre $t$
 
@@ -232,7 +250,7 @@ $$
 T_0 = \{1,\dots,97\}.
 $$
 
-Pour chaque fenetre $t \in \{1,\dots,170\}$ :
+Pour le protocole complet, chaque fenetre $t \in \{1,\dots,170\}$ est definie par :
 
 $$
 W_t =
@@ -284,6 +302,12 @@ Le projet distingue :
 1. apprentissage de la fonction de score
 2. optimisation Optuna
 3. evaluation holdout finale
+
+Le point important est que le holdout est maintenant **physiquement separe** dans un autre CSV :
+
+- `main.py` ne charge que `dataset_dev.csv`
+- `optuna_xgb_simple.py` ne charge que `dataset_dev.csv`
+- `evaluate_holdout_xgb.py` est le seul script qui recharge aussi `dataset_holdout.csv`
 
 Les constantes sont :
 
@@ -795,27 +819,33 @@ $$
 Z_{F,ij} = \frac{X_{F,ij}^\star - \mu_j^{(F)}}{\sigma_j^{(F)}}.
 $$
 
-### 13.2 Poids du sous-score
+### 13.2 Operateur lineaire du sous-score
 
-Pour chaque colonne :
+Pour chaque famille, on standardise aussi la cible train :
 
 $$
-w_{F,j}^{\text{raw}} = \operatorname{corr}(Z_{F,\cdot j}, g^{(z)}),
+g_i^{(z)} = \frac{g_i - \mu_g}{\sigma_g}.
 $$
 
-ou $g^{(z)}$ est la cible train standardisee.
+Puis on construit un operateur lineaire a partir des correlations marginales entre chaque coordonnee standardisee et la cible standardisee :
 
-Puis :
+$$
+w_{F,j}^{\text{raw}} = \operatorname{corr}(Z_{F,\cdot j}, g^{(z)}).
+$$
+
+On normalise ensuite ce vecteur de poids :
 
 $$
 w_F = \frac{w_F^{\text{raw}}}{\|w_F^{\text{raw}}\|_2}.
 $$
 
-Le sous-score de famille vaut :
+Le sous-score de famille vaut alors :
 
 $$
 s_F = Z_F w_F.
 $$
+
+Autrement dit, le code actif utilise une combinaison lineaire heuristique guidee par les correlations marginales a la cible.
 
 Concretement, le code produit :
 
@@ -839,9 +869,21 @@ s_{\text{stabilite}}
 \in \mathbb{R}^{120 \times 4}.
 $$
 
-Le score final est appris sur cette matrice exactement comme un score lineaire standard.
+Le score final est appris sur cette matrice exactement avec la meme logique.
 
-Si :
+Si l'on note $Z_S$ la version standardisee de $S$, alors chaque composante brute du vecteur de poids vaut :
+
+$$
+\alpha_j^{\text{raw}} = \operatorname{corr}(Z_{S,\cdot j}, g^{(z)}),
+$$
+
+puis :
+
+$$
+\alpha = \frac{\alpha^{\text{raw}}}{\|\alpha^{\text{raw}}\|_2}.
+$$
+
+Si l'on note :
 
 $$
 \alpha =
@@ -856,7 +898,7 @@ $$
 alors le score final d'une fenetre vaut :
 
 $$
-s = S \alpha.
+s = Z_S \alpha.
 $$
 
 Autrement dit :
@@ -864,14 +906,17 @@ Autrement dit :
 $$
 \operatorname{score\_final}
 =
-\alpha_1 \operatorname{score\_classification}
+\alpha_1 z_{\text{classification}}
 +
-\alpha_2 \operatorname{score\_separation}
+\alpha_2 z_{\text{separation}}
 +
-\alpha_3 \operatorname{score\_generalization}
+\alpha_3 z_{\text{generalization}}
 +
-\alpha_4 \operatorname{score\_stabilite}.
+\alpha_4 z_{\text{stabilite}}.
 $$
+
+Les quantites $z_{\text{classification}}, z_{\text{separation}}, z_{\text{generalization}}, z_{\text{stabilite}}$
+sont les coordonnees standardisees de la fenetre dans la base finale, avant application de l'operateur lineaire.
 
 Le fichier `artifacts/score_function.json` sauvegarde :
 
@@ -879,13 +924,12 @@ Le fichier `artifacts/score_function.json` sauvegarde :
 - les variables retenues dans chaque famille
 - le modele final sur les `4` sous-scores
 
-## 15. Signification de `train`, `test` et `all`
+## 15. Signification de `train` et `all`
 
 Dans `main.py` :
 
 - `train` = fenetres `1..120`
-- `test` = fenetres `121..170`
-- `all` = fenetres `1..170`
+- `all` = les memes fenetres `1..120` du dataset de developpement
 
 Mathématiquement :
 
@@ -897,20 +941,14 @@ $$
 $$
 
 $$
-\operatorname{corr}_{\text{test}}
-=
-\operatorname{corr}(s_t, g_t)
-\quad \text{pour } t=121,\dots,170,
-$$
-
-$$
 \operatorname{corr}_{\text{all}}
 =
 \operatorname{corr}(s_t, g_t)
-\quad \text{pour } t=1,\dots,170.
+\quad \text{pour } t=1,\dots,120.
 $$
 
-`all` est donc une statistique descriptive globale, pas le critere principal de generalisation.
+Le holdout n'apparait plus dans `main.py`.
+Le critere principal de generalisation est l'evaluation finale realisee par `evaluate_holdout_xgb.py` sur $\mathcal{W}_{\text{holdout}}$.
 
 ## 16. Objectif Optuna
 
@@ -931,13 +969,23 @@ J(\theta)
 \operatorname{median}\bigl(s_1(\theta), \dots, s_{120}(\theta)\bigr).
 $$
 
+Ici :
+
+- $s_t(\theta)$ designe le `score_metric` de la fenetre $t$
+- l'objectif Optuna est donc bien la mediane des scores de fenetre
+- il ne s'agit pas d'une moyenne
+- il ne s'agit pas non plus d'une mediane de `gain_ratio`
+
 Optuna ne maximise donc pas directement :
 
 - ni l'accuracy
 - ni l'AUC
 - ni `gain_effective`
+- ni `gain_ratio`
 
 Il maximise la mediane du score meta appris auparavant.
+
+Le holdout n'est plus evalue dans `optuna_xgb_simple.py`.
 
 ## 17. Evaluation holdout finale
 
@@ -945,6 +993,8 @@ Le script `evaluate_holdout_xgb.py` recharge :
 
 - la fonction de score gelee
 - les meilleurs hyperparametres XGB
+- `dataset_dev.csv`
+- `dataset_holdout.csv`
 
 Puis il rejoue tout le processus sequentiel et n'analyse finalement que :
 
@@ -980,6 +1030,24 @@ $$
 \quad \text{si le denominateur est non nul.}
 $$
 
+Il faut insister sur le fait que :
+
+- `gain_ratio` n'est pas une mediane
+- `gain_ratio` n'est pas une moyenne de ratios par fenetre
+- `gain_ratio` est un ratio global agrege, obtenu comme quotient des sommes
+
+Autrement dit :
+
+$$
+\operatorname{gain\_ratio}_{\text{holdout}}
+\neq
+\operatorname{median}\left(
+\frac{G_{\text{real}}^{(121)}}{G_{\max}^{(121)}},
+\dots,
+\frac{G_{\text{real}}^{(170)}}{G_{\max}^{(170)}}
+\right).
+$$
+
 Le script calcule aussi :
 
 $$
@@ -992,6 +1060,14 @@ $$
 \operatorname{score\_mean}_{\text{holdout}}
 =
 \frac{1}{50}\sum_{t=121}^{170} s_t,
+$$
+
+ainsi que :
+
+$$
+\operatorname{gain\_effective\_mean}_{\text{holdout}}
+=
+\frac{1}{50}\sum_{t=121}^{170} \operatorname{gain\_effective}_t,
 $$
 
 et :

@@ -191,6 +191,22 @@ def trade_return_series(y_pred, y_true, tp_gain, fp_loss):
     return np.where(trade_truth == 1, float(tp_gain), -float(fp_loss)).astype(float)
 
 
+def _normalize_no_opportunity_effective(realized_return, window_size, fp_loss):
+    """Normalise la qualite d'une fenetre sans opportunite entre pire perte et zero trade."""
+    window_size = int(window_size)
+    if window_size <= 0:
+        return 1.0
+
+    worst_trade_returns = np.full(window_size, -float(fp_loss), dtype=float)
+    worst_return = cumulative_return(worst_trade_returns)
+
+    if abs(worst_return) < 1e-12:
+        return 1.0
+
+    normalized = (float(realized_return) - worst_return) / (0.0 - worst_return)
+    return float(np.clip(normalized, 0.0, 1.0))
+
+
 def balance_metric_dict(y_pred, y_true, balance_start, tp_gain, fp_loss):
     """Construit le bloc des metriques de gain pour une fenetre."""
     y_pred = np.asarray(y_pred)
@@ -207,7 +223,11 @@ def balance_metric_dict(y_pred, y_true, balance_start, tp_gain, fp_loss):
     gain_max_possible = balance_max - balance_start
 
     if gain_max_possible == 0:
-        gain_effective = 1.0 if trade_returns.size == 0 else 0.0
+        gain_effective = _normalize_no_opportunity_effective(
+            realized_return,
+            window_size=y_true.size,
+            fp_loss=fp_loss,
+        )
     else:
         gain_effective = gain_realized / gain_max_possible
 

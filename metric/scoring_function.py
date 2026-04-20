@@ -4,6 +4,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from metric import basis_transforms
+from metric import correlation_analysis
+
 
 def standardize_matrix(X, eps=1e-12):
     """Centre-reduit une matrice en ignorant les NaN puis remplit les NaN restants par 0."""
@@ -31,24 +34,87 @@ def score_operator(Z, w):
 
 def pearson_corr_safe(x, y, eps=1e-12):
     """Correlation de Pearson robuste avec exclusion des NaN."""
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-
-    valid_mask = np.isfinite(x) & np.isfinite(y)
-    if np.sum(valid_mask) < 2:
-        return 0.0
-
-    x_valid = x[valid_mask]
-    y_valid = y[valid_mask]
-
-    if np.std(x_valid) < eps or np.std(y_valid) < eps:
-        return 0.0
-
-    return float(np.corrcoef(x_valid, y_valid)[0, 1])
+    return correlation_safe(x, y, method="pearson", eps=eps)
 
 
-def fit_linear_score_model(X, feature_names, target, target_name="target_gain", eps=1e-12):
-    """Apprend un score lineaire a partir d'une base de metriques."""
+def correlation_safe(x, y, method="pearson", eps=1e-12):
+    """Correlation robuste configurable avec exclusion des NaN."""
+    return correlation_analysis.correlation_safe(x, y, method=method, eps=eps)
+
+
+def _fit_marginal_corr_weights(Z, target_z, corr_method="pearson", eps=1e-12):
+    """Construit un operateur lineaire a partir des correlations marginales a la cible."""
+    w = np.array(
+        [
+            correlation_safe(Z[:, j], target_z, method=corr_method, eps=eps)
+            for j in range(Z.shape[1])
+        ],
+        dtype=float,
+    )
+
+    w_norm = np.linalg.norm(w)
+    if w_norm < eps:
+        return np.ones_like(w) / np.sqrt(len(w))
+
+    return w / w_norm
+
+
+def _fit_ridge_weights(Z, target_z, ridge_lambda):
+    """Resout l'operateur ridge (Z^T Z + lambda I)^-1 Z^T y sur donnees standardisees."""
+    ridge_lambda = float(ridge_lambda)
+    if ridge_lambda < 0.0:
+        raise ValueError("ridge_lambda doit etre positif ou nul.")
+
+    n_features = Z.shape[1]
+    lhs = Z.T @ Z + ridge_lambda * np.eye(n_features, dtype=float)
+    rhs = Z.T @ target_z
+
+    try:
+        return np.linalg.solve(lhs, rhs)
+    except np.linalg.LinAlgError:
+        return np.linalg.pinv(lhs) @ rhs
+
+
+def _orthogonalize_basis_coordinates(Z, method, eps=1e-12):
+    """Orthogonalise une base standardisee et retourne la transformation associee."""
+    if method != "qr":
+        raise ValueError(
+            f"Methode d'orthogonalisation inconnue: {method}"
+        )
+
+    orthogonalization = basis_transforms.orthogonalize_family_qr(Z, tol=eps)
+    return orthogonalization["orthogonal_matrix"], {
+        "enabled": True,
+        "method": method,
+        "transform_matrix": orthogonalization["transform_matrix"].tolist(),
+        "r_matrix": orthogonalization["r_matrix"].tolist(),
+    }
+
+
+def _normalize_basis_coordinates(Z, eps=1e-12):
+    """Normalise les vecteurs d'une base et retourne la transformation associee."""
+    normalization = basis_transforms.normalize_family_columns(Z, eps=eps)
+    return normalization["normalized_matrix"], {
+        "enabled": True,
+        "norms_before": normalization["norms_before"].tolist(),
+        "transform_matrix": normalization["transform_matrix"].tolist(),
+    }
+
+
+def fit_linear_score_model(
+    X,
+    feature_names,
+    target,
+    target_name="target_gain",
+    eps=1e-12,
+    operator_type="ridge",
+    ridge_lambda=1.0,
+    orthogonalize=False,
+    orthogonalization_method="qr",
+    normalize=False,
+    target_corr_method="pearson",
+):
+    """Apprend un score lineaire a partir d'une base de metriques standardisees."""
     X = np.asarray(X, dtype=float)
     target = np.asarray(target, dtype=float)
 
@@ -68,35 +134,87 @@ def fit_linear_score_model(X, feature_names, target, target_name="target_gain", 
     target_z = (target - target_mean) / target_std
     target_z = np.nan_to_num(target_z, nan=0.0)
 
-    w = np.array(
-        [pearson_corr_safe(Z[:, j], target_z, eps=eps) for j in range(Z.shape[1])],
-        dtype=float,
-    )
+    learning_basis = Z
+    orthogonalization_payload = {
+        "enabled": False,
+        "method": None,
+        "transform_matrix": None,
+        "r_matrix": None,
+    }
+    normalization_payload = {
+        "enabled": False,
+        "norms_before": None,
+        "transform_matrix": None,
+    }
+    basis_transform = np.eye(Z.shape[1], dtype=float)
 
-    w_norm = np.linalg.norm(w)
-    if w_norm < eps:
-        w = np.ones_like(w) / np.sqrt(len(w))
+    if orthogonalize:
+        learning_basis, orthogonalization_payload = _orthogonalize_basis_coordinates(
+            Z,
+            method=orthogonalization_method,
+            eps=eps,
+        )
+        basis_transform = basis_transform @ np.asarray(
+            orthogonalization_payload["transform_matrix"],
+            dtype=float,
+        )
+
+    if normalize:
+        learning_basis, normalization_payload = _normalize_basis_coordinates(
+            learning_basis,
+            eps=eps,
+        )
+        basis_transform = basis_transform @ np.asarray(
+            normalization_payload["transform_matrix"],
+            dtype=float,
+        )
+
+    if operator_type == "ridge":
+        w = _fit_ridge_weights(learning_basis, target_z, ridge_lambda=ridge_lambda)
+    elif operator_type == "marginal_corr":
+        w = _fit_marginal_corr_weights(
+            learning_basis,
+            target_z,
+            corr_method=target_corr_method,
+            eps=eps,
+        )
     else:
-        w = w / w_norm
+        raise ValueError(f"Type d'operateur lineaire inconnu: {operator_type}")
 
-    score_values = score_operator(Z, w)
+    score_values = score_operator(learning_basis, w)
 
     return {
         "model_type": "linear",
+        "operator_type": operator_type,
         "feature_names": kept_feature_names,
         "mu": mu_kept.tolist(),
         "sigma": sigma_kept.tolist(),
         "weights": w.tolist(),
+        "ridge_lambda": float(ridge_lambda),
+        "orthogonalized": bool(orthogonalization_payload["enabled"]),
+        "orthogonalization_method": orthogonalization_payload["method"],
+        "orthogonalization_transform": orthogonalization_payload["transform_matrix"],
+        "orthogonalization_r": orthogonalization_payload["r_matrix"],
+        "normalized": bool(normalization_payload["enabled"]),
+        "normalization_norms_before": normalization_payload["norms_before"],
+        "normalization_transform": normalization_payload["transform_matrix"],
+        "basis_transform": basis_transform.tolist(),
+        "target_corr_method": target_corr_method,
         "target_name": target_name,
         "target_mean": float(target_mean),
         "target_std": float(target_std),
-        "training_target_corr": pearson_corr_safe(score_values, target, eps=eps),
+        "training_target_corr": correlation_safe(
+            score_values,
+            target,
+            method=target_corr_method,
+            eps=eps,
+        ),
     }, score_values
 
 
 def apply_linear_score_model(X, score_model):
     """Applique un score lineaire sauvegarde a une matrice deja alignee sur feature_names."""
-    Z = standardize_with_score_model(X, score_model)
+    Z = score_coordinates_with_model(X, score_model)
     weights = np.asarray(score_model["weights"], dtype=float)
     return score_operator(Z, weights)
 
@@ -154,6 +272,44 @@ def apply_score_model_frame(frame_like, score_model, return_components=False):
     return score_values
 
 
+def extract_score_coordinates_frame(frame_like, score_model):
+    """Extrait les coordonnees Z dans la base finale juste avant l'operateur lineaire."""
+    model_type = score_model.get("model_type", "linear")
+
+    if model_type == "linear":
+        frame = _as_feature_frame(frame_like)
+        feature_names = score_model["feature_names"]
+        X = frame[feature_names].values.astype(float)
+        Z = score_coordinates_with_model(X, score_model)
+        return pd.DataFrame(Z, columns=feature_names)
+
+    if model_type != "hierarchical_family_score":
+        raise ValueError(f"Type de modele de score inconnu: {model_type}")
+
+    frame = _as_feature_frame(frame_like)
+    family_components = {}
+
+    for family_name, family_model in score_model["family_models"].items():
+        family_components[family_name] = _apply_linear_score_model_from_frame(
+            frame,
+            family_model,
+        )
+
+    final_model = score_model["final_model"]
+    family_score_names = final_model["feature_names"]
+    family_score_frame = pd.DataFrame(
+        {
+            name: family_components[name]
+            for name in family_score_names
+        }
+    )
+    Z = score_coordinates_with_model(
+        family_score_frame[family_score_names].values,
+        final_model,
+    )
+    return pd.DataFrame(Z, columns=family_score_names)
+
+
 def standardize_with_score_model(X, score_model):
     """Centre-reduit une matrice a l'aide des statistiques du modele de score."""
     X = np.asarray(X, dtype=float)
@@ -169,6 +325,48 @@ def standardize_with_score_model(X, score_model):
     Z = (X - mu) / sigma
     Z = np.nan_to_num(Z, nan=0.0)
     return Z
+
+
+def transform_score_coordinates(Z, score_model):
+    """Projette des coordonnees standardisees dans la base eventuellement orthogonalisee."""
+    Z = np.asarray(Z, dtype=float)
+
+    if score_model.get("basis_transform") is not None:
+        transform_matrix = np.asarray(
+            score_model["basis_transform"],
+            dtype=float,
+        )
+        if transform_matrix.ndim != 2:
+            raise ValueError("La matrice de transformation du modele est invalide.")
+        if Z.shape[1] != transform_matrix.shape[0]:
+            raise ValueError(
+                "Le nombre de colonnes de Z ne correspond pas a la transformation du modele."
+            )
+        return Z @ transform_matrix
+
+    if not score_model.get("orthogonalized", False):
+        return Z
+
+    transform_matrix = np.asarray(
+        score_model["orthogonalization_transform"],
+        dtype=float,
+    )
+
+    if transform_matrix.ndim != 2:
+        raise ValueError("La matrice d'orthogonalisation du modele est invalide.")
+
+    if Z.shape[1] != transform_matrix.shape[0]:
+        raise ValueError(
+            "Le nombre de colonnes de Z ne correspond pas a la transformation du modele."
+        )
+
+    return Z @ transform_matrix
+
+
+def score_coordinates_with_model(X, score_model):
+    """Construit les coordonnees finales dans la base du modele avant l'operateur lineaire."""
+    Z = standardize_with_score_model(X, score_model)
+    return transform_score_coordinates(Z, score_model)
 
 
 def save_score_model(score_model, path, metadata=None):

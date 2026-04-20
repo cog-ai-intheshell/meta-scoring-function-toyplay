@@ -161,6 +161,18 @@ def write_dataset_csv(rows, pixel_cols, output_path):
             writer.writerow(payload)
 
 
+def split_protocol_rows(rows, dev_windows, initial_train_size, window_size):
+    """Decoupe la sequence temporelle en CSV dev et holdout sans melanger l'ordre."""
+    split_index = int(initial_train_size) + int(dev_windows) * int(window_size)
+
+    if split_index <= 0 or split_index >= len(rows):
+        raise ValueError(
+            "Le split dev/holdout est invalide pour la taille du dataset genere."
+        )
+
+    return rows[:split_index], rows[split_index:]
+
+
 def summarize_sequence(values):
     """Resume une sequence binaire par sa taille, ses comptes et son nombre de switches."""
     switches = sum(left != right for left, right in zip(values, values[1:]))
@@ -192,6 +204,16 @@ def main():
         ),
     )
     parser.add_argument("--output", default=str(config.GENERATOR_OUTPUT_PATH), help="Chemin de sortie du CSV final.")
+    parser.add_argument(
+        "--output-dev",
+        default=str(config.GENERATOR_DEV_OUTPUT_PATH),
+        help="Chemin de sortie du CSV dev (train initial + 120 premieres fenetres).",
+    )
+    parser.add_argument(
+        "--output-holdout",
+        default=str(config.GENERATOR_HOLDOUT_OUTPUT_PATH),
+        help="Chemin de sortie du CSV holdout (50 dernieres fenetres).",
+    )
     parser.add_argument("--random-state", type=int, default=config.GENERATOR_RANDOM_STATE, help="Seed pour melanger les pools positifs/negatifs.")
     parser.add_argument(
         "--digit-positive-min-label",
@@ -242,10 +264,22 @@ def main():
         reordered_rows.append(row)
 
     write_dataset_csv(reordered_rows, pixel_cols, args.output)
+    dev_rows, holdout_rows = split_protocol_rows(
+        reordered_rows,
+        dev_windows=config.N_WINDOWS,
+        initial_train_size=config.INITIAL_TRAIN_SIZE,
+        window_size=config.MODEL_LIFE_WINDOW,
+    )
+    write_dataset_csv(dev_rows, pixel_cols, args.output_dev)
+    write_dataset_csv(holdout_rows, pixel_cols, args.output_holdout)
 
     summary = summarize_sequence(target_sequence)
     print(f"Saved to: {Path(args.output).resolve()}")
+    print(f"Saved dev split to: {Path(args.output_dev).resolve()}")
+    print(f"Saved holdout split to: {Path(args.output_holdout).resolve()}")
     print(f"n_samples: {summary['n_samples']}")
+    print(f"n_samples_dev: {len(dev_rows)}")
+    print(f"n_samples_holdout: {len(holdout_rows)}")
     print(f"zeros: {summary['zeros']}")
     print(f"ones: {summary['ones']}")
     print(f"switches: {summary['switches']}")

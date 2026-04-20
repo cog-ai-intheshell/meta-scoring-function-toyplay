@@ -80,3 +80,36 @@ def load_prebuilt_dataset(path=config.DATASET_PATH):
         "path": path,
         "mode": "csv_prebuilt",
     }
+
+
+def protocol_split_index(dev_windows=config.N_WINDOWS):
+    """Retourne l'index de coupe entre dev et holdout dans le protocole complet."""
+    return config.required_samples(dev_windows)
+
+
+def load_protocol_dataset(
+    dev_path=config.DATASET_DEV_PATH,
+    holdout_path=config.DATASET_HOLDOUT_PATH,
+):
+    """Recharge le protocole complet en concaténant les CSV dev et holdout."""
+    dev_dataset = load_prebuilt_dataset(dev_path)
+    holdout_dataset = load_prebuilt_dataset(holdout_path)
+
+    if dev_dataset["feature_names"] != holdout_dataset["feature_names"]:
+        raise ValueError(
+            "Les features du CSV dev et du CSV holdout ne correspondent pas."
+        )
+
+    X = np.vstack([dev_dataset["data"], holdout_dataset["data"]])
+    y = np.concatenate([dev_dataset["momentum"], holdout_dataset["momentum"]])
+
+    return {
+        "data": X,
+        "momentum": y,
+        "sequence_stats": sequence_statistics(y),
+        "feature_names": dev_dataset["feature_names"],
+        "path": (
+            f"{Path(dev_path).resolve()} + {Path(holdout_path).resolve()}"
+        ),
+        "mode": "csv_dev_plus_holdout",
+    }

@@ -91,12 +91,30 @@ def main():
         callbacks=[print_trial_summary],
     )
 
-    best_rows_all = run_window_backtest(study.best_params, config.N_WINDOWS)
-    best_rows_train = best_rows_all[:config.OPTUNA_TRAIN_WINDOWS]
-    best_rows_holdout = best_rows_all[config.OPTUNA_TRAIN_WINDOWS:]
-
+    best_rows_train = run_window_backtest(study.best_params, config.OPTUNA_TRAIN_WINDOWS)
     train_evaluation = evaluate_rows_with_score(best_rows_train, score_model)
-    holdout_evaluation = evaluate_rows_with_score(best_rows_holdout, score_model)
+    trial_rows = []
+
+    for trial in study.trials:
+        if trial.value is None:
+            continue
+
+        trial_rows.append(
+            {
+                "trial_number": int(trial.number),
+                "score_median": float(trial.value),
+                "score_corr_gain_effective": float(
+                    trial.user_attrs.get("score_corr_gain_effective", 0.0)
+                ),
+                "gain_ratio": float(trial.user_attrs.get("gain_ratio", 0.0)),
+                "tp": int(trial.user_attrs.get("tp", 0)),
+                "tn": int(trial.user_attrs.get("tn", 0)),
+                "fp": int(trial.user_attrs.get("fp", 0)),
+                "fn": int(trial.user_attrs.get("fn", 0)),
+            }
+        )
+
+    trial_rows.sort(key=lambda row: row["trial_number"])
 
     result = {
         "best_value": float(study.best_value),
@@ -105,8 +123,9 @@ def main():
         "optuna_train_windows": config.OPTUNA_TRAIN_WINDOWS,
         "holdout_windows": config.HOLDOUT_WINDOWS,
         "dataset_path": str(config.DATASET_PATH),
+        "holdout_dataset_path": str(config.DATASET_HOLDOUT_PATH),
         "train_evaluation": train_evaluation,
-        "holdout_evaluation": holdout_evaluation,
+        "trial_history": trial_rows,
     }
 
     config.BEST_PARAMS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -121,8 +140,8 @@ def main():
     print("=== Train evaluation (windows 1..120) ===")
     print(train_evaluation)
     print()
-    print("=== Holdout evaluation (windows 121..170) ===")
-    print(holdout_evaluation)
+    print("=== Holdout evaluation ===")
+    print("Non calcule ici : le holdout est externalise et reserve a evaluate_holdout_xgb.py.")
     print()
     print("=== Saved to ===")
     print(config.BEST_PARAMS_PATH.resolve())

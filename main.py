@@ -5,16 +5,18 @@ from xgboost import XGBClassifier
 
 import config
 from data_gathering import prebuilt_dataset
+from metric import algebra
 from metric import correlation_analysis
 from metric import scoring_function
 from metric import window_metrics
+from ploting import plot_referential_score_evolution
 
 
 # ============================================================
 # 2. Chargement dataset preconstruit
 # ============================================================
 
-temporal_data = prebuilt_dataset.load_prebuilt_dataset()
+temporal_data = prebuilt_dataset.load_prebuilt_dataset(config.DATASET_DEV_PATH)
 
 X = temporal_data["data"]
 y = temporal_data["momentum"]
@@ -35,9 +37,13 @@ print(f"Source dataset        : {temporal_data['path'].resolve()}")
 print(f"Taux momentum         : {temporal_stats['momentum_rate']:.4f}")
 print(f"Switches temporels    : {temporal_stats['switches']}")
 print(f"Train initial         : {config.INITIAL_TRAIN_SIZE}")
-print(f"Fenêtres              : {config.N_WINDOWS}")
+print(f"Fenêtres dev          : {config.N_WINDOWS}")
+print(f"Fenêtres holdout      : {config.HOLDOUT_WINDOWS}")
 print(f"Taille fenêtre        : {config.MODEL_LIFE_WINDOW}")
 print()
+
+target_corr_method_label = config.TARGET_CORR_METHOD.capitalize()
+redundancy_corr_method_label = config.REDUNDANCY_CORR_METHOD.capitalize()
 
 
 # ============================================================
@@ -51,8 +57,84 @@ def train_model(X_train, y_train, seed=42):
     return model
 
 
-def build_empirical_basis(X_values, column_names, target_values, corr_threshold):
-    """Construit une base de variables non constantes, peu corrélées et de rang utile."""
+def compute_basis_geometry_metrics(matrix, ridge_lambda):
+    """Calcule les invariants geometriques principaux d'une base de travail."""
+    matrix = np.asarray(matrix, dtype=float)
+    gram = algebra.gram_matrix(matrix)
+    covariance = algebra.covariance_matrix(matrix)
+
+    return {
+        "gram": gram,
+        "covariance": covariance,
+        "det_gram": algebra.matrix_determinant(gram),
+        "det_cov": algebra.matrix_determinant(covariance),
+        "logdet_cov_plus_lambda_i": algebra.regularized_logdet(
+            covariance,
+            ridge_lambda=ridge_lambda,
+        ),
+    }
+
+
+def build_referential_frame(
+    window_ids,
+    basis_coordinates,
+    basis_feature_names,
+    score_values,
+    gain_effective_values,
+):
+    """Construit les coordonnees du point dans la base finale avant application de l'operateur."""
+    basis_coordinates = np.asarray(basis_coordinates, dtype=float)
+
+    if basis_coordinates.ndim != 2:
+        raise ValueError("basis_coordinates doit etre une matrice 2D.")
+
+    clean_feature_names = [
+        name.replace("score_", "")
+        for name in basis_feature_names
+    ]
+
+    referential_payload = {
+        "model_life_window": np.asarray(window_ids, dtype=int),
+    }
+
+    for column_index, column_name in enumerate(clean_feature_names):
+        referential_payload[column_name] = basis_coordinates[:, column_index]
+
+    referential_payload["score_metric"] = np.asarray(score_values, dtype=float)
+    referential_payload["gain_effective"] = np.asarray(gain_effective_values, dtype=float)
+
+    return pd.DataFrame(referential_payload)
+
+
+def format_linear_operator_phi(
+    feature_names,
+    weights,
+    symbol="phi",
+    point_symbol="z_t",
+    coordinate_suffix="_t",
+):
+    """Formate l'operateur lineaire du score sur une fenetre donnee."""
+    clean_feature_names = [
+        name.replace("score_", "")
+        for name in feature_names
+    ]
+    terms = [
+        f"{weight:+.6f}·{name}{coordinate_suffix}"
+        for name, weight in zip(clean_feature_names, weights)
+    ]
+    rhs = " ".join(terms) if terms else "0"
+    return f"{symbol}({point_symbol}) = {rhs}"
+
+
+def build_empirical_basis(
+    X_values,
+    column_names,
+    target_values,
+    corr_threshold,
+    target_corr_method,
+    redundancy_corr_method,
+):
+    """Construit une base libre par filtrage de corrélation puis ajout glouton par rang."""
     X_values = np.asarray(X_values, dtype=float)
     target_values = np.asarray(target_values, dtype=float)
     X_clean = np.nan_to_num(X_values, nan=0.0)
@@ -66,9 +148,10 @@ def build_empirical_basis(X_values, column_names, target_values, corr_threshold)
 
     if non_constant_names:
         target_corr = {
-            name: scoring_function.pearson_corr_safe(
+            name: scoring_function.correlation_safe(
                 X_values[:, name_to_index[name]],
                 target_values,
+                method=target_corr_method,
             )
             for name in non_constant_names
         }
@@ -76,6 +159,7 @@ def build_empirical_basis(X_values, column_names, target_values, corr_threshold)
         corr_df = correlation_analysis.correlation_matrix_ignore_nan(
             X_values[:, non_constant_indices],
             non_constant_names,
+            method=redundancy_corr_method,
         )
         filtered_names, dropped_corr = correlation_analysis.select_uncorrelated_columns_by_target_corr(
             corr_df,
@@ -125,6 +209,8 @@ def build_family_score_bundle(
     family_cols,
     target_train,
     corr_threshold,
+    target_corr_method,
+    redundancy_corr_method,
 ):
     """Apprend le sous-score d'une famille et l'applique aux splits train, test et global."""
     family_basis = build_empirical_basis(
@@ -132,6 +218,8 @@ def build_family_score_bundle(
         family_cols,
         target_train,
         corr_threshold=corr_threshold,
+        target_corr_method=target_corr_method,
+        redundancy_corr_method=redundancy_corr_method,
     )
 
     selected_cols = family_basis["selected_names"]
@@ -145,6 +233,9 @@ def build_family_score_bundle(
         selected_cols,
         target_train,
         target_name=f"gain_effective_{family_name}",
+        operator_type=config.SCORE_OPERATOR_TYPE,
+        ridge_lambda=config.SCORE_OPERATOR_RIDGE_LAMBDA,
+        target_corr_method=target_corr_method,
     )
     test_scores = scoring_function.apply_linear_score_model(
         df_test[family_model["feature_names"]].values,
@@ -256,16 +347,17 @@ print()
 # 7. Matrice globale des métriques
 # ============================================================
 
-metric_cols = window_metrics.ALL_METRIC_COLS
+all_metric_cols = window_metrics.ALL_METRIC_COLS
+base_metric_cols = window_metrics.REALIZED_WINDOW_METRIC_COLS
 
-X_metrics = df_windows[metric_cols].values
+X_metrics = df_windows[base_metric_cols].values
 
 print("=== Aperçu des fenêtres ===")
 print(df_windows.head())
 print()
 
-print("=== Matrice globale des métriques ===")
-print(df_windows[metric_cols].head())
+print("=== Matrice globale des métriques réalisées de fenêtre ===")
+print(df_windows[base_metric_cols].head())
 print()
 
 
@@ -296,7 +388,7 @@ print("=== Colonnes constantes / quasi constantes ===")
 constant_cols = []
 quasi_constant_cols = []
 
-for j, name in enumerate(metric_cols):
+for j, name in enumerate(base_metric_cols):
     s = np.std(X_metrics_clean[:, j])
     if s < 1e-12:
         constant_cols.append(name)
@@ -316,15 +408,18 @@ print()
 
 basis_all = build_empirical_basis(
     X_metrics,
-    metric_cols,
+    base_metric_cols,
     df_windows["gain_effective"].values.astype(float),
     corr_threshold=config.CORR_THRESHOLD,
+    target_corr_method=config.TARGET_CORR_METHOD,
+    redundancy_corr_method=config.REDUNDANCY_CORR_METHOD,
 )
 selected_metric_names = basis_all["selected_names"]
 current = basis_all["current"]
 
 print(
-    f"=== Filtrage automatique des colonnes trop corrélées (>=|{config.CORR_THRESHOLD}|) ==="
+    f"=== Filtrage automatique des colonnes trop corrélées "
+    f"selon {redundancy_corr_method_label} (>=|{config.CORR_THRESHOLD}|) ==="
 )
 if basis_all["dropped_corr"]:
     for item in basis_all["dropped_corr"]:
@@ -339,7 +434,7 @@ else:
     print("Aucune")
 print()
 
-print("=== Base empirique gloutonne ===")
+print("=== Base empirique gloutonne sur métriques réalisées ===")
 print("Métriques candidates après filtrage :", basis_all["filtered_names"])
 print("Métriques retenues                  :", selected_metric_names)
 print()
@@ -370,12 +465,13 @@ print()
 # 12. Corrélations avec gain_effective
 # ============================================================
 
-print("=== Corrélations avec gain_effective ===")
-corr_with_gain = (
-    df_windows[metric_cols]
-    .corr(numeric_only=True)["gain_effective"]
-    .sort_values(ascending=False)
-)
+print(f"=== Corrélations {target_corr_method_label} avec gain_effective ===")
+corr_with_gain = correlation_analysis.correlations_to_target(
+    df_windows[all_metric_cols],
+    feature_names=all_metric_cols,
+    target_name="gain_effective",
+    method=config.TARGET_CORR_METHOD,
+).sort_values(ascending=False)
 print(corr_with_gain)
 print()
 
@@ -386,9 +482,10 @@ print()
 
 corr_df = correlation_analysis.correlation_matrix_ignore_nan(
     X_metrics,
-    metric_cols,
+    base_metric_cols,
+    method=config.REDUNDANCY_CORR_METHOD,
 )
-print("=== Corrélation entre métriques ===")
+print(f"=== Corrélation {redundancy_corr_method_label} entre métriques réalisées de fenêtre ===")
 print(corr_df.round(3))
 print()
 
@@ -397,7 +494,10 @@ print()
 # 14. Paires fortement corrélées
 # ============================================================
 
-print(f"=== Paires de métriques fortement corrélées (>=|{config.CORR_THRESHOLD}|) ===")
+print(
+    f"=== Paires de métriques réalisées de fenêtre fortement corrélées "
+    f"(>=|{config.CORR_THRESHOLD}|) ==="
+)
 correlated_pairs = correlation_analysis.extract_correlated_pairs(
     corr_df,
     threshold=config.CORR_THRESHOLD,
@@ -416,34 +516,25 @@ else:
     print("Aucune paire fortement corrélée trouvée.")
 print()
 
-print(f"=== Top {config.TOP_N_CORRELATED_PAIRS} paires les plus corrélées ===")
-for pair in correlated_pairs[:config.TOP_N_CORRELATED_PAIRS]:
-    print(
-        f"{pair['left']:25s} <-> {pair['right']:25s} : "
-        f"corr={pair['corr']:+.6f} abs={pair['abs_corr']:.6f}"
-    )
-print()
-
 
 # ============================================================
 # 15. Split score train / test
 # ============================================================
 
-df_score_train = df_windows.iloc[:config.SCORE_TRAIN_WINDOWS].copy()
-df_score_test = df_windows.iloc[config.SCORE_TRAIN_WINDOWS:].copy()
+df_score_train = df_windows.copy()
+df_score_test = df_windows.iloc[0:0].copy()
 target_gain_train = df_score_train["gain_effective"].values.astype(float)
-target_gain_test = df_score_test["gain_effective"].values.astype(float)
+target_gain_test = np.asarray([], dtype=float)
 
-print("=== Split apprentissage / evaluation du score ===")
-print(f"Fenêtres pour apprendre le score : {len(df_score_train)}")
-print(f"Fenêtres jamais vues pour test   : {len(df_score_test)}")
+print("=== Jeu de développement du score ===")
+print(f"Fenêtres disponibles dans dataset_dev : {len(df_score_train)}")
 print(
-    f"Train windows ids                : "
-    f"{df_score_train['window_id'].min()} -> {df_score_train['window_id'].max()}"
+    "Validation interne jamais vue        : "
+    "aucune, le holdout est externalisé dans dataset_holdout.csv"
 )
 print(
-    f"Test windows ids                 : "
-    f"{df_score_test['window_id'].min()} -> {df_score_test['window_id'].max()}"
+    f"Windows ids du dataset_dev           : "
+    f"{df_score_train['window_id'].min()} -> {df_score_train['window_id'].max()}"
 )
 print()
 
@@ -471,6 +562,8 @@ for family_name, family_cols in family_column_map.items():
         family_cols,
         target_gain_train,
         corr_threshold=config.CORR_THRESHOLD,
+        target_corr_method=config.TARGET_CORR_METHOD,
+        redundancy_corr_method=config.REDUNDANCY_CORR_METHOD,
     )
     family_bundles[family_name] = bundle
     family_score_cols.append(bundle["score_column"])
@@ -478,7 +571,7 @@ for family_name, family_cols in family_column_map.items():
     print(f"=== Famille {family_name} ===")
     print("Colonnes candidates :", family_cols)
     print("Colonnes non constantes :", bundle["basis"]["non_constant_names"])
-    print("Corrélation à gain_effective :")
+    print(f"Corrélation {target_corr_method_label} à gain_effective :")
     for name in sorted(
         bundle["basis"]["target_corr"],
         key=lambda item: -abs(bundle["basis"]["target_corr"][item]),
@@ -489,7 +582,7 @@ for family_name, family_cols in family_column_map.items():
         )
     print(
         f"Filtrage corrélé automatique (>=|{config.CORR_THRESHOLD}|, "
-        "priorité à la corrélation cible) :"
+        f"priorité à la corrélation cible {target_corr_method_label}) :"
     )
     if bundle["basis"]["dropped_corr"]:
         for item in bundle["basis"]["dropped_corr"]:
@@ -534,12 +627,49 @@ final_score_model, final_train_scores = scoring_function.fit_linear_score_model(
     family_score_cols,
     target_gain_train,
     target_name="gain_effective",
+    operator_type=config.SCORE_OPERATOR_TYPE,
+    ridge_lambda=config.SCORE_OPERATOR_RIDGE_LAMBDA,
+    orthogonalize=config.ORTHOGONALIZE_FAMILY,
+    normalize=config.NORMALIZE_FAMILY,
+    target_corr_method=config.TARGET_CORR_METHOD,
 )
 final_family_score_cols_kept = final_score_model["feature_names"]
-Z_basis_train = scoring_function.standardize_with_score_model(
+Z_basis_train = scoring_function.score_coordinates_with_model(
     family_score_train_df[final_family_score_cols_kept].values,
     final_score_model,
 )
+Z_basis_all = scoring_function.score_coordinates_with_model(
+    family_score_all_df[final_family_score_cols_kept].values,
+    final_score_model,
+)
+final_basis_geometry = compute_basis_geometry_metrics(
+    Z_basis_train,
+    ridge_lambda=config.GEOMETRY_RIDGE_LAMBDA,
+)
+final_family_rank = algebra.family_rank(Z_basis_train)
+final_family_is_free = algebra.is_free_family(Z_basis_train)
+final_family_is_generating_ambient = algebra.is_generating_family(
+    Z_basis_train,
+    ambient_dimension=Z_basis_train.shape[0],
+)
+final_family_is_generating_subspace = algebra.is_generating_family(
+    Z_basis_train,
+    ambient_dimension=final_family_rank,
+)
+final_family_orthogonality = algebra.orthogonality_analysis(Z_basis_train)
+final_family_unit_norm = algebra.unit_norm_analysis(Z_basis_train)
+
+if config.REQUIRE_FREE_FAMILY and not final_family_is_free:
+    raise ValueError("La base finale doit etre une famille libre.")
+
+if config.REQUIRE_GENERATING_SUBSPACE and not final_family_is_generating_subspace:
+    raise ValueError("La base finale doit engendrer son sous-espace.")
+
+if config.ORTHOGONALIZE_FAMILY and not final_family_orthogonality["is_orthogonal"]:
+    raise ValueError(
+        "ORTHOGONALIZE_FAMILY=True mais la base finale n'est pas orthogonale."
+    )
+
 score_values_test = scoring_function.apply_linear_score_model(
     family_score_test_df[final_family_score_cols_kept].values,
     final_score_model,
@@ -550,13 +680,15 @@ score_values_all = scoring_function.apply_linear_score_model(
 )
 w = np.asarray(final_score_model["weights"], dtype=float)
 score_gain_corr_train = float(final_score_model["training_target_corr"])
-score_gain_corr_test = scoring_function.pearson_corr_safe(
+score_gain_corr_test = scoring_function.correlation_safe(
     score_values_test,
     target_gain_test,
+    method=config.TARGET_CORR_METHOD,
 )
-score_gain_corr_all = scoring_function.pearson_corr_safe(
+score_gain_corr_all = scoring_function.correlation_safe(
     score_values_all,
     df_windows["gain_effective"].values.astype(float),
+    method=config.TARGET_CORR_METHOD,
 )
 
 score_model = {
@@ -578,6 +710,31 @@ score_model = {
     },
     "final_model": final_score_model,
     "training_target_corr": score_gain_corr_train,
+    "final_basis_geometry": {
+        "det_gram": final_basis_geometry["det_gram"],
+        "det_cov": final_basis_geometry["det_cov"],
+        "logdet_cov_plus_lambda_i": final_basis_geometry["logdet_cov_plus_lambda_i"],
+        "lambda": config.GEOMETRY_RIDGE_LAMBDA,
+    },
+    "study_referential": {
+        "name": "R(O; classification; separation; generalization; stabilite)",
+        "origin": {
+            "classification": 0.0,
+            "separation": 0.0,
+            "generalization": 0.0,
+            "stabilite": 0.0,
+        },
+        "axes": [
+            "classification",
+            "separation",
+            "generalization",
+            "stabilite",
+        ],
+        "trajectory_parameter": "model_life_window",
+        "orthogonalized": bool(final_score_model.get("orthogonalized", False)),
+        "orthogonalization_method": final_score_model.get("orthogonalization_method"),
+        "normalized": bool(final_score_model.get("normalized", False)),
+    },
 }
 
 saved_score_path = scoring_function.save_score_model(
@@ -595,20 +752,85 @@ for name, weight in zip(final_family_score_cols_kept, w):
     print(f"{name:25s} : {weight:+.6f}")
 print()
 
+print("=== Operateur lineaire du score ===")
+print(f"Type                    : {final_score_model.get('operator_type', 'linear')}")
+if final_score_model.get("operator_type") == "ridge":
+    print(f"Ridge lambda            : {final_score_model.get('ridge_lambda', 0.0)}")
+print(f"Base orthogonalisee     : {final_score_model.get('orthogonalized', False)}")
+if final_score_model.get("orthogonalized", False):
+    print(
+        f"Methode                 : "
+        f"{final_score_model.get('orthogonalization_method', 'inconnue')}"
+    )
+print(f"Base normalisee         : {final_score_model.get('normalized', False)}")
+print()
+
+print("=== Operateur phi dans la base finale transformee ===")
+phi_basis_names = [
+    name.replace("score_", "")
+    for name in final_family_score_cols_kept
+]
+phi_dimension = len(phi_basis_names)
+phi_point_symbol = "z_t"
+phi_coordinates = ", ".join(f"{name}_t" for name in phi_basis_names)
+print(f"phi : R^{phi_dimension} -> R")
+print(f"{phi_point_symbol} = ({phi_coordinates})")
+print(f"phi({phi_point_symbol}) = w^T {phi_point_symbol}")
+print(format_linear_operator_phi(final_family_score_cols_kept, w, symbol="phi"))
+print("Sur toutes les fenetres a la fois : score = Z_basis @ w")
+print()
+
 print("=== Base finale après centrage-réduction ===")
 print("Sous-scores gardés :", final_family_score_cols_kept)
 print("Forme de Z_basis_train :", Z_basis_train.shape)
 print()
 
-print("=== Corrélation Pearson(score, gain_effective) sur les fenêtres train ===")
+print("=== Géométrie de la base finale ===")
+print(f"det(Gram)               : {final_basis_geometry['det_gram']}")
+print(f"det(Cov)                : {final_basis_geometry['det_cov']}")
+print(
+    f"logdet(Cov + λI)         : "
+    f"{final_basis_geometry['logdet_cov_plus_lambda_i']}"
+)
+print(f"λ utilisé               : {config.GEOMETRY_RIDGE_LAMBDA}")
+print()
+
+print("=== Etude de la famille ===")
+print(f"Nombre de vecteurs      : {Z_basis_train.shape[1]}")
+print(f"Dimension ambiante      : {Z_basis_train.shape[0]}")
+print(f"Rang de la famille      : {final_family_rank}")
+print(f"Famille libre           : {final_family_is_free}")
+print(f"Generatrice de R^n      : {final_family_is_generating_ambient}")
+print(f"Generatrice de son sous-espace : {final_family_is_generating_subspace}")
+print(f"Famille orthogonale     : {final_family_orthogonality['is_orthogonal']}")
+print(
+    f"Max |cosinus hors diag| : "
+    f"{final_family_orthogonality['max_abs_cosine_off_diagonal']:.6f}"
+)
+print(f"Tolerance orthogonalite : {final_family_orthogonality['tolerance']}")
+print(f"Famille normalisee      : {final_family_unit_norm['is_unit_norm_family']}")
+print(
+    f"Normes des vecteurs     : "
+    f"{np.array2string(final_family_unit_norm['norms'], precision=6)}"
+)
+print(
+    f"Max |norme - 1|         : "
+    f"{final_family_unit_norm['max_abs_norm_deviation']:.6f}"
+)
+print(f"Tolerance normalisation : {final_family_unit_norm['tolerance']}")
+print()
+
+print(
+    f"=== Corrélation {target_corr_method_label}(score, gain_effective) "
+    "sur le dataset de développement ==="
+)
 print(score_gain_corr_train)
 print()
 
-print("=== Corrélation Pearson(score, gain_effective) sur les fenêtres test jamais vues ===")
-print(score_gain_corr_test)
-print()
-
-print("=== Corrélation Pearson(score, gain_effective) sur l'ensemble des fenêtres ===")
+print(
+    f"=== Corrélation {target_corr_method_label}(score, gain_effective) "
+    "sur l'ensemble du dataset de développement ==="
+)
 print(score_gain_corr_all)
 print()
 
@@ -625,25 +847,52 @@ for column in family_score_all_df.columns:
     df_windows[column] = family_score_all_df[column].values
 
 df_windows["score_metric"] = score_values_all
+referential_df = build_referential_frame(
+    df_windows["window_id"].values,
+    Z_basis_all,
+    final_family_score_cols_kept,
+    score_values_all,
+    df_windows["gain_effective"].values,
+)
+referential_plot_path = plot_referential_score_evolution(
+    referential_df,
+    title="Evolution des coordonnees Z du modele dans R(O; classification; separation; generalization; stabilite), indexee par model-life-window",
+    path=config.REFERENTIAL_PLOT_PATH,
+    split_window_id=None,
+)
+
+print("=== Référentiel d'étude ===")
+print("R(O; classification; separation; generalization; stabilite)")
+print("Origine O :", "(0, 0, 0, 0)")
+print("Axes : classification, separation, generalization, stabilite")
+print("Parametre de trajectoire : model_life_window")
+if final_score_model.get("orthogonalized", False):
+    print("Base finale orthogonalisee : oui, par decomposition QR.")
+else:
+    print("Base finale orthogonalisee : non.")
+
+if final_score_model.get("normalized", False):
+    print("Base finale normalisee : oui, les vecteurs du referentiel ont une norme unitaire sur le train.")
+else:
+    print("Base finale normalisee : non.")
+
+print("Les coordonnees affichees ci-dessous sont les coordonnees Z dans la base finale transformee, avant application de l'operateur lineaire du score.")
+print("Aperçu des coordonnées dans le référentiel :")
+print(referential_df.head())
+print()
 
 print("=== Aperçu score_metric vs gain_effective ===")
 print(df_windows[["window_id", "score_metric", "gain_effective"]].head())
 print()
-
-print("=== Aperçu hold-out score_metric vs gain_effective ===")
+print("=== Holdout externe ===")
 print(
-    df_score_test.assign(
-        **{
-            column: family_score_test_df[column].values
-            for column in family_score_test_df.columns
-        },
-        score_metric=score_values_test,
-    )[["window_id"] + family_score_cols + ["score_metric", "gain_effective"]].head()
+    "Le holdout n'est plus visible dans main.py. "
+    "Utiliser evaluate_holdout_xgb.py pour juger dataset_holdout.csv."
 )
 print()
 
-print("=== Corrélation finale score_metric / gain_effective sur le hold-out ===")
-print(score_gain_corr_test)
+print("=== Trajectoire du score dans le référentiel ===")
+print(referential_plot_path.resolve())
 print()
 
 
@@ -651,13 +900,14 @@ print()
 # 19. Corrélations du score avec toutes les métriques
 # ============================================================
 
-print("=== Corrélations avec score_metric ===")
-metric_plus_score_cols = metric_cols + ["score_metric"]
-corr_with_score = (
-    df_windows[metric_plus_score_cols]
-    .corr(numeric_only=True)["score_metric"]
-    .sort_values(ascending=False)
-)
+print(f"=== Corrélations {target_corr_method_label} avec score_metric ===")
+metric_plus_score_cols = all_metric_cols + ["score_metric"]
+corr_with_score = correlation_analysis.correlations_to_target(
+    df_windows[metric_plus_score_cols],
+    feature_names=metric_plus_score_cols,
+    target_name="score_metric",
+    method=config.TARGET_CORR_METHOD,
+).sort_values(ascending=False)
 print(corr_with_score)
 print()
 
@@ -679,7 +929,7 @@ else:
 print("\n=== Vecteurs de base après centrage-réduction ===")
 
 if Z_basis_train is not None:
-    for idx, (name, col) in enumerate(zip(basis_ex_ante_cols_kept, Z_basis_train.T)):
+    for idx, (name, col) in enumerate(zip(final_family_score_cols_kept, Z_basis_train.T)):
         print(f"\nVecteur normalisé {idx+1} : {name}")
         print(col)
 else:

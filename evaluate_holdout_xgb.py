@@ -1,11 +1,14 @@
 import json
+from datetime import datetime, timezone
 
 import pandas as pd
 
 from backtest import evaluate_rows_with_score, run_window_backtest
 import config
+from data_gathering import prebuilt_dataset
 from metric import scoring_function
-from ploting import plot_probability_predictions
+from ploting import plot_probability_predictions, plot_referential_score_evolution
+from tools.name_generator import generate_unique_model_name
 
 
 DETAIL_COLUMNS = [
@@ -39,6 +42,50 @@ def load_best_params():
     return best_params, payload
 
 
+def build_holdout_run_record(model_name, best_params, holdout_summary):
+    """Construit la ligne CSV d'historique d'un run holdout."""
+    record = {
+        "evaluated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "model_name": model_name,
+    }
+
+    for key, value in config.score_model_metadata().items():
+        record[f"config_{key}"] = value
+
+    for key, value in best_params.items():
+        record[f"xgb_{key}"] = value
+
+    record.update(
+        {
+            "gain_realized": holdout_summary["gain_realized"],
+            "gain_ratio": holdout_summary["gain_ratio"],
+            "score_median": holdout_summary["score_median"],
+            "tp": holdout_summary["tp"],
+            "tn": holdout_summary["tn"],
+            "fp": holdout_summary["fp"],
+            "fn": holdout_summary["fn"],
+        }
+    )
+
+    return record
+
+
+def append_holdout_run_csv(record):
+    """Ajoute un run holdout a l'historique CSV des modeles evalues."""
+    csv_path = config.HOLDOUT_MODEL_RUNS_CSV_PATH
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    new_row_df = pd.DataFrame([record])
+
+    if csv_path.exists():
+        existing_df = pd.read_csv(csv_path)
+        updated_df = pd.concat([existing_df, new_row_df], ignore_index=True, sort=False)
+    else:
+        updated_df = new_row_df
+
+    updated_df.to_csv(csv_path, index=False)
+    return csv_path
+
+
 def main():
     """Rejoue le backtest avec le meilleur XGB et produit le rapport holdout final."""
     if not config.SCORE_MODEL_PATH.exists():
@@ -50,11 +97,14 @@ def main():
     config.validate_score_model_metadata(score_model)
 
     best_params, best_payload = load_best_params()
+    model_name = generate_unique_model_name()
+    protocol_dataset = prebuilt_dataset.load_protocol_dataset()
 
     rows_all, prediction_rows_all = run_window_backtest(
         best_params,
-        config.N_WINDOWS,
+        config.FULL_PROTOCOL_WINDOWS,
         collect_predictions=True,
+        dataset=protocol_dataset,
     )
     rows_holdout = rows_all[config.OPTUNA_TRAIN_WINDOWS:]
     holdout_summary = evaluate_rows_with_score(rows_holdout, score_model)
@@ -72,6 +122,21 @@ def main():
     for family_name, values in family_components.items():
         detail_df[family_name] = values
     prediction_df = pd.DataFrame(prediction_rows_holdout)
+    holdout_coordinates_df = scoring_function.extract_score_coordinates_frame(
+        detail_df,
+        score_model,
+    )
+    holdout_referential_df = pd.DataFrame(
+        {
+            "model_life_window": detail_df["window_id"].values.astype(int),
+            "classification": holdout_coordinates_df["score_classification"].values.astype(float),
+            "separation": holdout_coordinates_df["score_separation"].values.astype(float),
+            "generalization": holdout_coordinates_df["score_generalization"].values.astype(float),
+            "stabilite": holdout_coordinates_df["score_stabilite"].values.astype(float),
+            "score_metric": score_values_holdout.astype(float),
+            "gain_effective": detail_df["gain_effective"].values.astype(float),
+        }
+    )
 
     plot_path = plot_probability_predictions(
         prediction_df["y_true"].values,
@@ -80,15 +145,34 @@ def main():
         title="Holdout XGB probability predictions",
         path=config.HOLDOUT_PLOT_PATH,
     )
+    referential_plot_path = plot_referential_score_evolution(
+        holdout_referential_df,
+        title="Trajectoire du holdout dans R(O; classification; separation; generalization; stabilite), indexee par model-life-window",
+        path=config.HOLDOUT_REFERENTIAL_PLOT_PATH,
+    )
+    holdout_run_record = build_holdout_run_record(
+        model_name,
+        best_params,
+        holdout_summary,
+    )
+    holdout_runs_csv_path = append_holdout_run_csv(holdout_run_record)
 
     result = {
+        "model_name": model_name,
         "best_params": best_params,
         "best_value_from_optuna": best_payload.get("best_value"),
         "optuna_train_windows": config.OPTUNA_TRAIN_WINDOWS,
         "holdout_windows": config.HOLDOUT_WINDOWS,
+        "dataset_dev_path": str(config.DATASET_DEV_PATH),
+        "dataset_holdout_path": str(config.DATASET_HOLDOUT_PATH),
         "holdout_summary": holdout_summary,
         "holdout_details": detail_df[DETAIL_COLUMNS].to_dict(orient="records"),
+        "holdout_run_record": holdout_run_record,
+        "holdout_runs_csv_path": str(holdout_runs_csv_path),
         "holdout_plot_path": str(plot_path) if plot_path is not None else None,
+        "holdout_referential_plot_path": (
+            str(referential_plot_path) if referential_plot_path is not None else None
+        ),
     }
 
     config.HOLDOUT_EVALUATION_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -97,8 +181,15 @@ def main():
         encoding="utf-8",
     )
 
+    print("=== Model name ===")
+    print(model_name)
+    print()
     print("=== Best params loaded ===")
     print(best_params)
+    print()
+    print("=== Protocol datasets loaded ===")
+    print(config.DATASET_DEV_PATH.resolve())
+    print(config.DATASET_HOLDOUT_PATH.resolve())
     print()
     print("=== Holdout summary (windows 121..170) ===")
     print(holdout_summary)
@@ -110,6 +201,13 @@ def main():
         print("=== Holdout plot saved to ===")
         print(plot_path.resolve())
         print()
+    if referential_plot_path is not None:
+        print("=== Holdout referential plot saved to ===")
+        print(referential_plot_path.resolve())
+        print()
+    print("=== Holdout runs CSV updated ===")
+    print(holdout_runs_csv_path.resolve())
+    print()
     print("=== Saved to ===")
     print(config.HOLDOUT_EVALUATION_PATH.resolve())
 
